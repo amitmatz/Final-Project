@@ -2,7 +2,7 @@
 ```
 /project_root
 │
-├── LICENSE                  # אופציונליי
+├── LICENSE                  # אופציונלי
 ├── README.md                # הסבר על הפרויקט + איך להריץ
 ├── requirements.txt         # רשימת ספריות Python
 │

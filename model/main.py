@@ -12,4 +12,4 @@
 # from model import EEGEncoderDecoder
 
 if __name__ == "__main__":
-    print("hello project")
+    print("hello project!")

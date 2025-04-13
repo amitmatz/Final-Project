@@ -1,0 +1,8 @@
+{
+  "patients": {
+    "Patient_01": {
+      "lfp_folder": "Patient_01/LFP_signals/",
+      "labels_file": "Patient_01/Labels.txt"
+    }
+  }
+}

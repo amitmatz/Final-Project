@@ -3,39 +3,50 @@ import numpy as np
 import pandas as pd
 import json
 import h5py
+from scipy.io import loadmat
 from defines import BASE_DATA_PATH, PROCESSED_DATA_DIR, PATIENTS_CONFIG_PATH
 
-# הקלטה התחילה בזמן מוחלט זה (ביחידות שניות)
+# התחלה מוחלטת של ההקלטה
 LFP_START_TIME = 558138174.511444
-SAMPLING_RATE = 1000                  # 1 kHz (כל 1ms)
-SAMPLE_STEP = 1.0 / SAMPLING_RATE     # 0.001 שניות בין דגימות
+SAMPLING_RATE = 480000
+SAMPLE_STEP = 1.0 / SAMPLING_RATE
 
 
 def load_mat_file(filepath):
     """
-    Loads LFP signals and builds a real-world time vector using known start time and sampling rate.
+    Loads LFP signals and constructs time vector in absolute time.
     """
     with h5py.File(filepath, 'r') as f:
         lfp_data = f['LFP_tt']
         values = np.array(lfp_data).squeeze()
-
         num_samples = len(values)
         times = np.arange(0, num_samples) * SAMPLE_STEP + LFP_START_TIME
-
     return times, values
 
 
-def load_labels(filepath):
+def load_labels_from_mat(filepath):
     """
-    Loads label timestamps from a tab-delimited file (start, end, label).
-    Assumes label times are relative to the beginning of the recording and need offset correction.
+    Loads labels from a .mat file (not HDF5-based) using scipy.io.loadmat
     """
-    return pd.read_csv(filepath, delimiter='\t', header=None, names=['start', 'end', 'label'])
+    mat = loadmat(filepath)
+
+    word_times = mat['word_times']  # shape: (3, N)
+    words_raw = mat['words']        # shape: (1, N), cell array
+
+    starts = word_times[0, :]
+    ends = word_times[1, :]
+    word_ids = word_times[2, :].astype(int).flatten()
+
+    words = [str(w[0]) for w in words_raw[0]]
+    labels = [words[i] for i in word_ids]
+
+    df = pd.DataFrame({'start': starts, 'end': ends, 'label': labels})
+    return df
 
 
 def normalize_label(label):
     """
-    Normalizes label strings to consistent values for classification.
+    Normalizes label variants into unified categories.
     """
     if label in ['Haarye', 'Arye']:
         return 'Arye'
@@ -49,14 +60,10 @@ def normalize_label(label):
 
 def process_patient(patient_name, patient_info):
     """
-    Processes one patient's data:
-    - Loads LFP signals and constructs absolute timestamps
-    - Loads label file and applies offset to align with LFP times
-    - Extracts signal segments corresponding to each label
-    - Saves the processed dataset as .npy
+    Loads LFP signals and labeled segments, matches labels to signals, and saves processed dataset.
     """
     lfp_dir = os.path.join(BASE_DATA_PATH, patient_info['lfp_folder'])
-    labels_path = os.path.join(BASE_DATA_PATH, patient_info['labels_file'])
+    labels_path = os.path.join(BASE_DATA_PATH, patient_info['labels_file'])  # sound_w_times.mat
 
     print(f"Processing {patient_name}...")
     print(f"Looking for LFP signals at: {lfp_dir}")
@@ -76,12 +83,7 @@ def process_patient(patient_name, patient_info):
     print("✅ Example all_times (absolute):", all_times[:5])
     print(f"LFP time range: {all_times[0]} -> {all_times[-1]}")
 
-    labels_df = load_labels(labels_path)
-
-    # הוספת offset מוחלט לתוויות
-    labels_df['start'] += LFP_START_TIME
-    labels_df['end'] += LFP_START_TIME
-
+    labels_df = load_labels_from_mat(labels_path)
     print(f"First label (absolute): {labels_df.iloc[0]['start']} -> {labels_df.iloc[0]['end']}")
 
     data_struct = []
@@ -106,7 +108,7 @@ def process_patient(patient_name, patient_info):
 
 def process_all_patients():
     """
-    Reads the patient configuration JSON and processes all defined patients.
+    Reads the patient config and processes all patient data.
     """
     with open(PATIENTS_CONFIG_PATH, 'r') as f:
         config = json.load(f)

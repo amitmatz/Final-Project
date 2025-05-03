@@ -19,7 +19,7 @@ venv/
 # Model files and data outputs
 *.pth
 *.pt
-*.npy
+*.npy       # ← נוספה שורה זו כדי להתעלם מקבצי numpy
 
 # Personal logs or temp files
 *.log

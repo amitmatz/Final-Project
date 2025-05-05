@@ -10,3 +10,5 @@ PATIENTS_CONFIG_PATH = os.path.join("config", "patients_config.json")
 
 # היכן לשמור קבצי פלט של דאטה מעובד
 PROCESSED_DATA_DIR = "processed_data/"
+
+

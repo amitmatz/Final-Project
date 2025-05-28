@@ -1,10 +1,12 @@
 classification/
-├── data/
-│   ├── matrices_X.pt        ← קטעי אותות LFP שזהוו כדיבור בלבד
-│   └── labels_X.pt          ← התוויות ("האריה"=0, "אהב"=1, "תות"=2)
+├── data/                      ← קבצי הקלט לאחר detection (LFP + תוויות)
+│   ├── matrices_0.pt          ← אותות לפציינט 0
+│   └── labels_0.pt            ← תוויות תואמות (0=האריה, 1=אהב, 2=תות)
 │
-├── plots/                   ← תמונות של loss, accuracy, confusion matrix
+├── plots/                     ← גרפים ותוצרים גרפיים
+│   ├── loss_accuracy_p0.png   ← גרף אימון
+│   └── confusion_matrix_p0.png← מטריצת בלבול
 │
-├── model.py                 ← מודל LSTM + Attention + Fully Connected
-├── utils.py                 ← טעינה, עיבוד נתונים, אימון, בדיקה, גרפים
-└── main.py                  ← תסריט ראשי להרצת המודל על פציינטים
+├── model.py                   ← הגדרת המודל LSTM+Attention
+├── utils.py                   ← פונקציות עזר: טעינה, אימון, בדיקה, גרפים
+└── main.py                    ← קובץ ריצה מרכזי: train + test

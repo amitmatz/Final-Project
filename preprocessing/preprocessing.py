@@ -1,139 +1,71 @@
-# preprocessing/preprocessing.py
-
 import os
+import json
 import numpy as np
 import pandas as pd
-import json
 import h5py
-from defines import BASE_DATA_PATH, PROCESSED_DATA_DIR, PATIENTS_CONFIG_PATH
+from defines import BASE_DATA_PATH, PATIENTS_CONFIG_PATH, PROCESSED_DATA_DIR
 
-
-# =============================================================
-# טוען קובץ LFP
-# =============================================================
-
-def load_mat_file(filepath):
-    """
-    Load LFP signal and construct time vector manually.
-    החילוץ הוא ישירות מתוך השדה 'g' בקובץ ה-MATLAB, עם קצב דגימה קבוע של 48000Hz.
-    """
-    SAMPLE_RATE = 48000  # ידוע שהקלטות הוקלטו ב-48000Hz
-
-    with h5py.File(filepath, 'r') as f:
-        refs = f['#refs#']
-
-        # טוען את האות
-        signal = np.array(refs['g']).flatten()
-
-        # בונה את הזמנים בעצמי לפי קצב הדגימה
-        times_seconds = np.arange(len(signal)) / SAMPLE_RATE
-
-        print(f"[DEBUG] Loaded {len(times_seconds)} times and {len(signal)} values from {os.path.basename(filepath)}")
-        print(f"[DEBUG] LFP times range: {times_seconds.min()} to {times_seconds.max()} seconds")
-
-        return times_seconds, signal
-
-
-# =============================================================
-# טוען קובץ תוויות (Labels)
-# =============================================================
-
-def load_labels(filepath):
-    """
-    Load label segments from a tab-separated text file.
-    """
-    return pd.read_csv(filepath, delimiter='\t', header=None, names=['start', 'end', 'label'])
-
-
-# =============================================================
-# טוען את ה-Offset
-# =============================================================
-
-def load_time_offset(offset_file_path):
-    """
-    Load time offset from sound_w_times.mat.
-    """
-    with h5py.File(offset_file_path, 'r') as f:
-        offset_array = np.array(f['new_start_end_times_micsec'])
-        offset_microsec = offset_array[0][0]
-        offset_sec = offset_microsec / 1e6
-        print(f"Loaded offset: {offset_sec} seconds")
+def load_offset(mat_path):
+    with h5py.File(mat_path, 'r') as f:
+        offset_array = f['new_start_end_times_micsec'][:]
+        start_micro = offset_array[0][0]
+        offset_sec = start_micro / 1e6
+        # [DEBUG] הדפסה לצורך איתור תזוזה בין אודיו ל־LFP
+        # print(f"[DEBUG] Offset (from audio→LFP): {offset_sec:.6f} s")
         return offset_sec
 
+def load_labels(label_path):
+    df = pd.read_csv(label_path, delimiter="\t", names=["start", "end", "label"])
+    # [DEBUG] הדפסה למספר תוויות שנטענו
+    # print(f"[DEBUG] Loaded {len(df)} labels")
+    return df
 
-# =============================================================
-# עיבוד חולה אחד
-# =============================================================
+def export_lfp_csvs(lfp_folder, out_dir):
+    for fname in sorted(os.listdir(lfp_folder)):
+        if not fname.endswith(".mat"):
+            continue
+        path = os.path.join(lfp_folder, fname)
+        with h5py.File(path, 'r') as f:
+            signal = np.array(f["#refs#/g"]).flatten()
+            sr = float(f["#refs#/f/rowTimes"]["sampleRate"][()])
+            times = np.arange(len(signal)) / sr
+            df = pd.DataFrame({"time": times, "signal": signal})
+            out_path = os.path.join(out_dir, fname.replace(".mat", ".csv"))
+
+            # [DEBUG] בדיקות מבנה הדאטה
+            # print(f"[DEBUG] Attempting to export {fname} to {out_path}")
+            # print(f"[DEBUG] DataFrame shape: {df.shape}, types:\n{df.dtypes}")
+            # print(f"[DEBUG] First 5 rows:\n{df.head()}")
+
+            df.to_csv(out_path, index=False)
+            print(f"[EXPORT] {fname}: {len(signal)} samples → {times[-1]:.3f}s → {out_path}")
 
 def process_patient(patient_name, patient_info):
-    """
-    Process LFP signals and label segments for a specific patient.
-    """
-    # נתיב לתיקיית קבצי ה-LFP המתוקנים
-    lfp_dir = r'G:\My Drive\FinalProject\Data\Patient_01\ZIP_files_and_backup_data_Patient_01\pt2_LFPs_sound\LFPs'
-    labels_path = os.path.join(BASE_DATA_PATH, patient_info['labels_file'])
+    print(f"===== Processing {patient_name} =====")
 
-    print(f"\n----- Processing {patient_name} -----")
+    label_path = os.path.join(BASE_DATA_PATH, patient_info["labels_file"])
+    offset_path = os.path.join(BASE_DATA_PATH, patient_info["offset_file"])
+    lfp_dir = os.path.join(BASE_DATA_PATH, patient_info["lfp_folder"])
+    csv_out_dir = os.path.join(PROCESSED_DATA_DIR, "csvs")
+    os.makedirs(csv_out_dir, exist_ok=True)
 
-    # --- שלב 1: טעינת התוויות ---
-    labels_df = load_labels(labels_path)
-    print(f"\n[DEBUG] Loaded {len(labels_df)} labels")
-    print("[DEBUG] First 3 labels BEFORE offset adjustment:")
-    print(labels_df.head(3))
+    offset = load_offset(offset_path)
 
-    # --- שלב 2: טעינת ה-Offset ---
-    offset_file = r'G:\My Drive\FinalProject\Data\Patient_01\ZIP_files_and_backup_data_Patient_01\pt2_LFPs_sound\sound_w_times.mat'
-    offset = load_time_offset(offset_file)
+    df_labels = load_labels(label_path)
+    df_labels["start_adj"] = df_labels["start"] + offset
+    df_labels["end_adj"] = df_labels["end"] + offset
 
-    # --- שלב 3: התאמת התוויות עם Offset ---
-    labels_df['start'] = labels_df['start'] - offset
-    labels_df['end'] = labels_df['end'] - offset
+    # [DEBUG] בדיקת תוויות מתוזמנות
+    # print(f"[DEBUG] Labels with positive adjusted times: {(df_labels['start_adj'] >= 0).sum()}")
+    # print(f"[DEBUG] Labels with negative adjusted times: {(df_labels['start_adj'] < 0).sum()}")
+    # print("[DEBUG] First 10 adjusted labels:")
+    # print(df_labels[["start_adj", "end_adj", "label"]].head(10))
 
-    print(f"\n[DEBUG] Offset applied: {offset} seconds")
-    print("[DEBUG] First 3 labels AFTER offset adjustment:")
-    print(labels_df.head(3))
-
-    # --- שלב 4: טעינת כל קבצי ה-LFP ---
-    all_times = None
-    all_channels = []
-
-    for file in sorted(os.listdir(lfp_dir)):
-        if file.endswith('.mat'):
-            times, values = load_mat_file(os.path.join(lfp_dir, file))
-            if all_times is None:
-                all_times = times
-            all_channels.append(values)
-
-    all_channels = np.stack(all_channels)  # shape: [num_channels, num_samples]
-
-    print(f"\n[DEBUG] Loaded {len(all_channels)} channels, shape={all_channels.shape}")
-    print(f"[DEBUG] Global LFP times range: {all_times.min()} to {all_times.max()} seconds")
-    print(f"[DEBUG] Total LFP timepoints: {len(all_times)}")
-
-    # --- שלב 5: חיתוך האות לפי התוויות ---
-    data_struct = []
-    for idx, row in labels_df.iterrows():
-        start, end, label = row['start'], row['end'], row['label']
-        indices = np.where((all_times >= start) & (all_times <= end))[0]
-        if len(indices) > 0:
-            segment = all_channels[:, indices]  # shape: [num_channels, num_samples]
-            data_struct.append({"signals": segment, "label": label})
-        else:
-            print(f"Warning: No signal found for label '{label}' ({start}-{end})")
-
-    # --- שלב 6: שמירת התוצאה ---
-    os.makedirs(PROCESSED_DATA_DIR, exist_ok=True)
-    np.save(os.path.join(PROCESSED_DATA_DIR, f"{patient_name}_data.npy"), data_struct)
-    print(f"\n✅ Saved processed data for {patient_name}. Total segments: {len(data_struct)}")
-
-
-# =============================================================
-# עיבוד כל החולים בקובץ קונפיג
-# =============================================================
+    export_lfp_csvs(lfp_dir, csv_out_dir)
 
 def process_all_patients():
     with open(PATIENTS_CONFIG_PATH, 'r') as f:
         config = json.load(f)
 
-    for patient_name, patient_info in config['patients'].items():
-        process_patient(patient_name, patient_info)
+    for name, info in config["patients"].items():
+        process_patient(name, info)

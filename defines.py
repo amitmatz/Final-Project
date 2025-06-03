@@ -14,3 +14,7 @@ PROCESSED_DATA_DIR = os.path.join(BASE_DIR, "processed_data")
 
 # נתיב מלא לקובץ המעובד עבור Patient_01 (לשימוש אם תרצה גישה ישירה)
 PROCESSED_PATH = os.path.join(PROCESSED_DATA_DIR, "Patient_01_data.npy")
+
+# נתיבים לקבצים
+OFFSET_FILE = r'G:/My Drive/FinalProject/Data/Patient_01/sound_w_times.mat'
+LABELS_FILE = r'G:/My Drive/FinalProject/Data/Patient_01/Labels.txt'

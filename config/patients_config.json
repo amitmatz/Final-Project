@@ -1,0 +1,9 @@
+{
+  "patients": {
+    "Patient_01": {
+      "lfp_folder": "Patient_01/LFP_signals/",
+      "labels_file": "Patient_01/Labels.txt",
+      "offset_file": "Patient_01/sound_w_times.mat"
+    }
+  }
+}

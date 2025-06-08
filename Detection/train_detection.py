@@ -33,11 +33,12 @@ X = torch.load(X_PATH)
 y = torch.load(Y_PATH)
 
 # וידוא צורת קלט
-assert len(X.shape) == 2 and X.shape[1] == SEQ_LENGTH
-assert len(y.shape) == 1
+assert len(X.shape) == 3 and X.shape[1] == SEQ_LENGTH and X.shape[2] == INPUT_SIZE, f"Unexpected X shape: {X.shape}"
+assert len(y.shape) == 1 or (len(y.shape) == 2 and y.shape[1] == 1), f"Unexpected y shape: {y.shape}"
 
 # המרת התוויות למימד מתאים
-y = y.view(-1, 1)
+if len(y.shape) == 1:
+    y = y.view(-1, 1)
 
 # יצירת מודל
 model = SpeechLSTM(INPUT_SIZE, HIDDEN_SIZE, OUTPUT_SIZE)
@@ -58,10 +59,7 @@ for epoch in range(NUM_EPOCHS):
         indices = permutation[i:i + BATCH_SIZE]
         batch_X, batch_y = X[indices], y[indices]
 
-        # הוספת מימד עבור input_size (כעת input_size=1)
-        batch_X = batch_X.unsqueeze(-1)
-
-        optimizer.zero_grad()
+        # אין צורך ב-unsqueeze - צורת הקלט כבר מתאימה
         outputs = model(batch_X)
         loss = criterion(outputs, batch_y)
         loss.backward()

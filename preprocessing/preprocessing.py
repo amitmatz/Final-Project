@@ -1,71 +1,76 @@
+# Detection/train_detection.py
+
 import os
-import json
-import numpy as np
-import pandas as pd
-import h5py
-from defines import BASE_DATA_PATH, PATIENTS_CONFIG_PATH, PROCESSED_DATA_DIR
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from detection_lstm import SpeechLSTM
 
-def load_offset(mat_path):
-    with h5py.File(mat_path, 'r') as f:
-        offset_array = f['new_start_end_times_micsec'][:]
-        start_micro = offset_array[0][0]
-        offset_sec = start_micro / 1e6
-        # [DEBUG] הדפסה לצורך איתור תזוזה בין אודיו ל־LFP
-        # print(f"[DEBUG] Offset (from audio→LFP): {offset_sec:.6f} s")
-        return offset_sec
+# ======================================================
+# קובץ זה מאמן את מודל ה-LSTM לזיהוי קטעים עם דיבור
+# ======================================================
 
-def load_labels(label_path):
-    df = pd.read_csv(label_path, delimiter="\t", names=["start", "end", "label"])
-    # [DEBUG] הדפסה למספר תוויות שנטענו
-    # print(f"[DEBUG] Loaded {len(df)} labels")
-    return df
+# נתיבי קבצי הקלט
+X_PATH = os.path.join("Detection", "models", "X_tensor.pt")
+Y_PATH = os.path.join("Detection", "models", "y_tensor.pt")
 
-def export_lfp_csvs(lfp_folder, out_dir):
-    for fname in sorted(os.listdir(lfp_folder)):
-        if not fname.endswith(".mat"):
-            continue
-        path = os.path.join(lfp_folder, fname)
-        with h5py.File(path, 'r') as f:
-            signal = np.array(f["#refs#/g"]).flatten()
-            sr = float(f["#refs#/f/rowTimes"]["sampleRate"][()])
-            times = np.arange(len(signal)) / sr
-            df = pd.DataFrame({"time": times, "signal": signal})
-            out_path = os.path.join(out_dir, fname.replace(".mat", ".csv"))
+# נתיב לשמירת המודל המאומן
+MODEL_PATH = os.path.join("Detection", "models", "detection_lstm.pth")
 
-            # [DEBUG] בדיקות מבנה הדאטה
-            # print(f"[DEBUG] Attempting to export {fname} to {out_path}")
-            # print(f"[DEBUG] DataFrame shape: {df.shape}, types:\n{df.dtypes}")
-            # print(f"[DEBUG] First 5 rows:\n{df.head()}")
+# פרמטרים למודל
+INPUT_SIZE = 1
+SEQ_LENGTH = 300
+HIDDEN_SIZE = 64
+OUTPUT_SIZE = 1
+NUM_EPOCHS = 10
+BATCH_SIZE = 32
+LEARNING_RATE = 0.001
 
-            df.to_csv(out_path, index=False)
-            print(f"[EXPORT] {fname}: {len(signal)} samples → {times[-1]:.3f}s → {out_path}")
+print("[INFO] Loading processed tensors...")
 
-def process_patient(patient_name, patient_info):
-    print(f"===== Processing {patient_name} =====")
+X = torch.load(X_PATH)
+y = torch.load(Y_PATH)
 
-    label_path = os.path.join(BASE_DATA_PATH, patient_info["labels_file"])
-    offset_path = os.path.join(BASE_DATA_PATH, patient_info["offset_file"])
-    lfp_dir = os.path.join(BASE_DATA_PATH, patient_info["lfp_folder"])
-    csv_out_dir = os.path.join(PROCESSED_DATA_DIR, "csvs")
-    os.makedirs(csv_out_dir, exist_ok=True)
+# וידוא מימדים
+assert X.dim() == 3 and X.shape[1] == SEQ_LENGTH and X.shape[2] == INPUT_SIZE
+assert y.dim() == 1 or y.dim() == 2
 
-    offset = load_offset(offset_path)
+# המרת התוויות למימד מתאים
+y = y.view(-1, 1)
 
-    df_labels = load_labels(label_path)
-    df_labels["start_adj"] = df_labels["start"] + offset
-    df_labels["end_adj"] = df_labels["end"] + offset
+# יצירת מודל
+model = SpeechLSTM(INPUT_SIZE, HIDDEN_SIZE, OUTPUT_SIZE)
+criterion = nn.BCEWithLogitsLoss()
+optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    # [DEBUG] בדיקת תוויות מתוזמנות
-    # print(f"[DEBUG] Labels with positive adjusted times: {(df_labels['start_adj'] >= 0).sum()}")
-    # print(f"[DEBUG] Labels with negative adjusted times: {(df_labels['start_adj'] < 0).sum()}")
-    # print("[DEBUG] First 10 adjusted labels:")
-    # print(df_labels[["start_adj", "end_adj", "label"]].head(10))
+print("[INFO] Starting training...")
 
-    export_lfp_csvs(lfp_dir, csv_out_dir)
+for epoch in range(NUM_EPOCHS):
+    model.train()
+    permutation = torch.randperm(X.size(0))
+    epoch_loss = 0
+    correct = 0
+    total = 0
 
-def process_all_patients():
-    with open(PATIENTS_CONFIG_PATH, 'r') as f:
-        config = json.load(f)
+    for i in range(0, X.size(0), BATCH_SIZE):
+        indices = permutation[i:i + BATCH_SIZE]
+        batch_X, batch_y = X[indices], y[indices]
 
-    for name, info in config["patients"].items():
-        process_patient(name, info)
+        # אין צורך ב־unsqueeze – הנתונים כבר 3D
+        outputs = model(batch_X)
+        loss = criterion(outputs, batch_y)
+        loss.backward()
+        optimizer.step()
+
+        epoch_loss += loss.item()
+        predictions = (torch.sigmoid(outputs) > 0.5).float()
+        correct += (predictions == batch_y).sum().item()
+        total += batch_y.size(0)
+
+    accuracy = correct / total
+    print(f"Epoch {epoch+1}/{NUM_EPOCHS} | Loss: {epoch_loss:.4f} | Accuracy: {accuracy:.4f}")
+
+# שמירת המודל
+os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+torch.save(model.state_dict(), MODEL_PATH)
+print(f"✅ Model saved to {MODEL_PATH}")

@@ -9,14 +9,19 @@
     │
     ├── detection/                # זיהוי נוכחות דיבור
     │   └── detection.ipynb       # מחברת לזיהוי אם יש ניסיון דיבור בכלל
-    │
-    ├── classification/           # סיווג ההברות / מילים
-    │   ├── model/
-    │   │   └── lstm_model.py     # הגדרת רשת LSTM
-    │   ├── train.py              # אימון המודל
-    │   ├── validate.py           # בדיקה על סט וולידציה
-    │   ├── param_optimizer.py    # אופטימיזציה של היפר-פרמטרים עם Optuna
-    │   └── utils.py              # פונקציות עזר כלליות
+    │     
+    ├── classification/
+    │   └──model/
+    │       └── lstm_model.py
+    │   └── classification_config.json
+    │   └── train.py
+    │   └── validate.py
+    │   └── dataset.py
+    │   └── utils.py
+    │   └── param_optimizer.py
+    │   └── results/
+    │   └── logs/
+    │   └── saved_models/
     │
     ├── results/                  # תוצאות האימון והבדיקה
     │   ├── plots/                # גרפים: accuracy, loss, confusion matrix

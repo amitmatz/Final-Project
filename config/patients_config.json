@@ -2,8 +2,15 @@
   "patients": {
     "Patient_01": {
       "lfp_folder": "Patient_01/LFP_signals/",
-      "labels_file": "Patient_01/Labels.txt",
-      "offset_file": "Patient_01/sound_w_times.mat"
+      "labels_file": "Patient_01/Labels/Detection_Labels/Patient1_Labels_Detection.txt",
+      "offset_file": "Patient_01/sound_w_times.mat",
+      "sample_rate": 2000,
+      "window_size": 500,
+      "stride": 250,
+      "overlap": 0.5,
+      "batch_size": 64,
+      "learning_rate": 0.001,
+      "epochs": 80
     }
   }
 }

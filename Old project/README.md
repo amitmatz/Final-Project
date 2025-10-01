@@ -13,6 +13,7 @@
     ├── classification/
     │   └──model/
     │       └── lstm_model.py
+    │       └── __init__.py
     │   └── classification_config.json
     │   └── train.py
     │   └── validate.py
@@ -21,6 +22,11 @@
     │   └── param_optimizer.py
     │   └── results/
     │   └── logs/
+    │       └── accuracy_train/
+    │            └── __init__.py
+    │       └── __init__.py
+    │       └── lstm_model.py
+    │       └── __init__.py
     │   └── saved_models/
     │
     ├── results/                  # תוצאות האימון והבדיקה

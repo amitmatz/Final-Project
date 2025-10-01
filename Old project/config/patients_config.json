@@ -1,0 +1,10 @@
+{
+  "_comment": "This JSON file serves as a configuration file for a data processing pipeline",
+  "patients": {
+    "Patient_03": {
+      "lfp_folder": "Patient_03/pt3_LFPs_sound/LFP_signals/",
+      "labels_file": "Patient_03/pt3_LFPs_sound/Labels.txt",
+      "offset_file": "G:\\My Drive\\FinalProject\\Data\\Patient_03\\pt3_LFPs_sound\\sound_w_times.mat"
+    }
+  }
+}

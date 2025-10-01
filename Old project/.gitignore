@@ -27,14 +27,14 @@ venv/
 *.tmp
 
 # Output folders
-Detection/models/
+Old project/Detection/models/
 results/
 
 # Ignore large data and log files
 *.npy
 *.csv
 *.tfevents.*
-Data/
-processed_data/
+Old project/Data/
+Old project/processed_data/
 logs/
 git reset HEAD~1

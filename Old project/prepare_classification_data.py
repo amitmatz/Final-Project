@@ -2,7 +2,7 @@ import numpy as np
 import os
 from sklearn.model_selection import train_test_split
 
-INPUT_PATH = "processed_data/Patient_01_detection_data_labeled.npy"
+INPUT_PATH = "processed_data/Patient_03_detection_data_labeled.npy"
 OUTPUT_DIR = "Data"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 

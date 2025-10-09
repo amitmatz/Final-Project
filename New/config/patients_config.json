@@ -1,0 +1,7 @@
+{
+  "patients": {
+    "Patient_03": {
+      "classification_npy": "processed_data/Patient_03_classification_data.npy"
+    }
+  }
+}

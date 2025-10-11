@@ -1,515 +1,362 @@
-#train_classification.py
+# =============================
+# train_classification.py
+# =============================
 import os
-from typing import Tuple, Dict, Any, List
+import random
+from dataclasses import dataclass
+from typing import Tuple, Optional, List
 
 import numpy as np
-from sklearn.metrics import f1_score, accuracy_score, classification_report, confusion_matrix
-from sklearn.model_selection import StratifiedShuffleSplit
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from sklearn.metrics import classification_report, confusion_matrix, f1_score, accuracy_score
 
+# ------------ LOG HELPERS ------------
+def _normpath(p: str) -> str:
+    try: return os.path.normpath(p)
+    except: return p
+def LOG_DEBUG(msg: str): print(f"[DEBUG] {msg}")
+def LOG_INFO(msg: str):  print(f"[INFO] {msg}")
+def LOG_WARN(msg: str):  print(f"[WARN] {msg}")
 
-# ===============================
-# Model (48→48 convs, LSTM input=48)
-# ===============================
-class LSTMClassifier(nn.Module):
-    def __init__(self, in_channels: int, lstm_hidden: int = 128, num_classes: int = 3, dropout_p: float = 0.5):
+# ------------ LABELS ------------
+LABEL_NAMES: List[str] = ["HAARYE", "TUT", "OTHER"]
+LABEL_TO_ID = {name: i for i, name in enumerate(LABEL_NAMES)}
+
+# ------------ MODEL ------------
+class ConvBlock1D(nn.Module):
+    """Conv1D -> Norm -> ReLU (optional MaxPool)."""
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int, dilation: int = 1,
+                 pool: bool = False, norm_type: str = "batch"):
         super().__init__()
-        self.relu = nn.ReLU()
-        self.conv1 = nn.Conv1d(in_channels, 48, kernel_size=15, stride=1, padding=0)
-        self.bn1   = nn.BatchNorm1d(48)
-        self.conv2 = nn.Conv1d(48, 48, kernel_size=5, stride=1, padding=0)
-        self.bn2   = nn.BatchNorm1d(48)
-        self.pool  = nn.MaxPool1d(kernel_size=2, stride=2)
+        padding = ((kernel_size - 1) // 2) * dilation
+        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size=kernel_size, stride=1,
+                              padding=padding, dilation=dilation)
+        if norm_type == "batch":
+            self.norm = nn.BatchNorm1d(out_ch)
+        elif norm_type == "group":
+            self.norm = nn.GroupNorm(num_groups=min(8, out_ch), num_channels=out_ch)
+        else:
+            raise ValueError("norm_type must be 'batch' or 'group'")
+        self.act  = nn.ReLU(inplace=True)
+        self.pool = nn.MaxPool1d(kernel_size=2, stride=2) if pool else None
 
-        self.lstm = nn.LSTM(
-            input_size=48,          # keep input=48 to match best run
-            hidden_size=lstm_hidden,
-            num_layers=1,
-            batch_first=True,
-            bidirectional=True
-        )
+    def forward(self, x):  # [B, C, T]
+        x = self.conv(x)
+        x = self.norm(x)
+        x = self.act(x)
+        if self.pool is not None:
+            x = self.pool(x)
+        return x
 
-        self.attn = nn.Sequential(
-            nn.Linear(lstm_hidden * 2, 64),
-            nn.Tanh(),
-            nn.Linear(64, 1)
-        )
+class LSTMClassifier(nn.Module):
+    """CNN + BiLSTM + (optional) MHA + additive attention head. Input: x [B,T,C] -> logits [B,num_classes]"""
+    def __init__(self, num_channels: int = 48, num_classes: int = 3,
+                 lstm_hidden: int = 128, lstm_layers: int = 1,
+                 attn_hidden: int = 64, dropout: float = 0.5,
+                 use_mha: bool = False, mha_heads: int = 4,
+                 conv_norm: str = "batch",
+                 k1: int = 15, k2: int = 5, use_dilation: bool = False):
+        super().__init__()
+        d1 = 1
+        d2 = (2 if use_dilation else 1)
 
-        self.fc_hidden  = nn.Linear(lstm_hidden * 2, 128)
-        self.dropout_fc = nn.Dropout(p=dropout_p)
+        # כמו במקור: שתי קונבולוציות עם (15,5), BN, ופולינג פעם אחת אחרי Conv2
+        self.conv1 = ConvBlock1D(num_channels, num_channels, kernel_size=k1, dilation=d1, pool=False, norm_type=conv_norm)
+        self.conv2 = ConvBlock1D(num_channels, num_channels, kernel_size=k2, dilation=d2, pool=True,  norm_type=conv_norm)
+
+        self.lstm = nn.LSTM(input_size=num_channels, hidden_size=lstm_hidden,
+                            num_layers=lstm_layers, batch_first=True, bidirectional=True)
+        enc_dim = lstm_hidden * 2
+
+        self.use_mha = use_mha
+        if use_mha:
+            self.mha    = nn.MultiheadAttention(embed_dim=enc_dim, num_heads=mha_heads, batch_first=True)
+            self.mha_ln = nn.LayerNorm(enc_dim)
+
+        self.attn = nn.Sequential(nn.Linear(enc_dim, attn_hidden), nn.Tanh(), nn.Linear(attn_hidden, 1))
+        self.fc_hidden  = nn.Linear(enc_dim, 128)
+        self.dropout_fc = nn.Dropout(dropout)
         self.fc_out     = nn.Linear(128, num_classes)
 
-        self._init_weights()
+    def temporal_attention_pool(self, h):  # h: [B,T,D] -> [B,D]
+        scores  = self.attn(h)                               # [B,T,1]
+        weights = torch.softmax(scores.squeeze(-1), dim=-1)  # [B,T]
+        ctx     = torch.einsum("btd,bt->bd", h, weights)     # [B,D]
+        return ctx
 
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, (nn.Conv1d, nn.Linear)):
-                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            if isinstance(m, nn.LSTM):
-                for name, param in m.named_parameters():
-                    if "weight" in name:
-                        nn.init.xavier_uniform_(param)
-                    elif "bias" in name:
-                        nn.init.zeros_(param)
+    def forward(self, x):  # x: [B,T,C]
+        x = x.transpose(1, 2)      # [B,C,T]
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = x.transpose(1, 2)      # [B,T,C]
 
-    def forward(self, x):  # x: (B, T, C)
-        # conv expects (B, C, T)
-        x = x.permute(0, 2, 1)                    # (B, C, T)
-        x = self.relu(self.bn1(self.conv1(x)))    # (B, 48, T-14)
-        x = self.relu(self.bn2(self.conv2(x)))    # (B, 48, T-18)
-        x = self.pool(x)                          # (B, 48, T')
-        x = x.permute(0, 2, 1)                    # (B, T', 48)
+        out, _ = self.lstm(x)      # [B,T,2H]
+        if self.use_mha:
+            mha_out, _ = self.mha(out, out, out)
+            out = self.mha_ln(out + mha_out)
 
-        lstm_out, _ = self.lstm(x)                # (B, T', 2H)
-        scores  = self.attn(lstm_out).squeeze(-1) # (B, T')
-        weights = F.softmax(scores, dim=1).unsqueeze(-1)
-        context = torch.sum(lstm_out * weights, dim=1)  # (B, 2H)
-
-        z = self.relu(self.fc_hidden(context))
+        feat = self.temporal_attention_pool(out)
+        z = F.relu(self.fc_hidden(feat))
         z = self.dropout_fc(z)
         logits = self.fc_out(z)
         return logits
 
+# ------------ UTILS ------------
+def set_seed(seed: int = 42):
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
-# ===============================
-# Data loading utilities
-# ===============================
-EXPECTED_T = 300
-EXPECTED_C = 48
-KNOWN_LABELS = ["HAARYE", "TUT", "OTHER"]
+def compute_channel_norm_stats(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    assert X.ndim == 3, f"Expected (N,T,C), got {X.shape}"
+    mu = X.mean(axis=(0, 1)); sigma = X.std(axis=(0, 1))
+    sigma[sigma < 1e-6] = 1.0
+    return mu, sigma
 
+def apply_channel_norm(X: np.ndarray, mu: np.ndarray, sigma: np.ndarray) -> np.ndarray:
+    return (X - mu.reshape(1, 1, -1)) / sigma.reshape(1, 1, -1)
 
-def _unwrap_scalar_ndarray(o: Any, max_depth: int = 20) -> Any:
-    depth = 0
-    while isinstance(o, np.ndarray) and o.shape == ():
-        o = o.item()
-        depth += 1
-        if depth >= max_depth:
-            break
-    return o
+class NPWindowDataset(Dataset):
+    def __init__(self, X: np.ndarray, y: np.ndarray):
+        self.X = torch.from_numpy(X.astype(np.float32))   # [N,T,C]
+        self.y = torch.from_numpy(y.astype(np.int64))     # [N]
+        assert self.X.ndim == 3 and self.y.ndim == 1 and self.X.shape[0] == self.y.shape[0]
+    def __len__(self): return self.X.shape[0]
+    def __getitem__(self, idx): return self.X[idx], self.y[idx]
 
+# ------------ LOSSES ------------
+class FocalLoss(nn.Module):
+    def __init__(self, alpha: Optional[torch.Tensor] = None, gamma: float = 2.0, reduction: str = 'mean'):
+        super().__init__()
+        self.register_buffer('alpha', alpha if alpha is not None else None)
+        self.gamma = gamma; self.reduction = reduction
+    def forward(self, logits, target):
+        ce = F.cross_entropy(logits, target, weight=self.alpha, reduction='none')
+        pt = torch.exp(-ce)
+        loss = (1 - pt) ** self.gamma * ce
+        return loss.mean() if self.reduction == 'mean' else (loss.sum() if self.reduction == 'sum' else loss)
 
-def _collect_arrays(obj: Any, sink: List[np.ndarray]):
-    obj = _unwrap_scalar_ndarray(obj)
-    if isinstance(obj, dict):
-        for v in obj.values():
-            _collect_arrays(v, sink)
-    elif isinstance(obj, (list, tuple)):
-        for v in obj:
-            _collect_arrays(v, sink)
-    elif isinstance(obj, np.ndarray):
-        if obj.dtype == object:
-            if obj.shape == ():
-                _collect_arrays(obj.item(), sink)
-            else:
-                for v in obj.flat:
-                    _collect_arrays(v, sink)
-        else:
-            sink.append(obj)
+def class_balanced_alpha(labels: np.ndarray, num_classes: int, beta: float = 0.9999) -> torch.Tensor:
+    counts = np.bincount(labels, minlength=num_classes).astype(np.float64)
+    eff = (1.0 - np.power(beta, counts)) / (1.0 - beta)
+    eff[eff == 0.0] = 1e-6
+    w = (counts.sum() / (num_classes * eff))
+    w = w / w.sum() * num_classes
+    return torch.tensor(w, dtype=torch.float32)
 
+# ------------ DATA LOADING ------------
+def load_patient_npy(path: str) -> Tuple[np.ndarray, np.ndarray]:
+    LOG_DEBUG(f"Loading { _normpath(path) }")
+    raw = np.load(path, allow_pickle=True)
+    LOG_DEBUG(f"Raw top-level: type={type(raw)}, shape={getattr(raw,'shape',None)}, dtype={getattr(raw,'dtype',None)}")
 
-def _pick_window_from_container(sample: Any) -> Tuple[np.ndarray, Any]:
-    s = _unwrap_scalar_ndarray(sample)
+    if isinstance(raw, np.ndarray) and raw.dtype == object:
+        X_list, y_list = [], []
+        for item in raw.tolist():
+            if not isinstance(item, dict):
+                raise ValueError('Expected dict items in object array')
+            sig = item.get('signals'); lab = item.get('label')
+            if isinstance(lab, str): lab = LABEL_TO_ID.get(lab, LABEL_TO_ID['OTHER'])
+            elif isinstance(lab, (np.integer, int)): lab = int(lab)
+            else: raise ValueError('Unsupported label type in npy list-of-dicts')
+            X_list.append(sig); y_list.append(lab)
+        X = np.stack(X_list, axis=0); y = np.array(y_list, dtype=np.int64)
+    elif isinstance(raw, dict) or (hasattr(raw, 'item') and isinstance(raw.item(), dict)):
+        d = raw if isinstance(raw, dict) else raw.item()
+        X, y = d['X'], d['y']
+    else:
+        raise ValueError('Unsupported npy format. Expect list-of-dicts {signals,label} or dict {X,y}.')
 
-    if isinstance(s, dict):
-        keys = {k.lower(): k for k in s.keys()}
-        x_keys = ["x", "data", "window", "windows", "features", "feat"]
-        y_keys = ["y", "label", "labels", "target", "class"]
-
-        X = None
-        y = None
-        for k in x_keys:
-            if k in keys:
-                X = _unwrap_scalar_ndarray(s[keys[k]])
-                break
-        for k in y_keys:
-            if k in keys:
-                y = _unwrap_scalar_ndarray(s[keys[k]])
-                break
-        if X is None:
-            arrays: List[np.ndarray] = []
-            _collect_arrays(s, arrays)
-            arrays2d = [a for a in arrays if isinstance(a, np.ndarray) and a.ndim >= 2]
-            if arrays2d:
-                X = arrays2d[0]
-        return (np.asarray(X) if X is not None else None, y)
-
-    if isinstance(s, (list, tuple)) and len(s) >= 2:
-        a = _unwrap_scalar_ndarray(s[0])
-        b = _unwrap_scalar_ndarray(s[1])
-        arr_a = a if isinstance(a, np.ndarray) else None
-        arr_b = b if isinstance(b, np.ndarray) else None
-
-        if arr_a is not None and arr_a.ndim >= 2 and (arr_b is None or arr_b.ndim < 2):
-            return np.asarray(arr_a), b
-        if arr_b is not None and arr_b.ndim >= 2 and (arr_a is None or arr_a.ndim < 2):
-            return np.asarray(arr_b), a
-
-        if arr_a is not None and arr_b is not None:
-            if arr_a.size >= arr_b.size:
-                return np.asarray(arr_a), b
-            else:
-                return np.asarray(arr_b), a
-
-    if isinstance(s, np.ndarray) and s.ndim >= 2:
-        return np.asarray(s), None
-
-    return None, None
-
-
-def _extract_from_object_samples(arr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    windows: List[np.ndarray] = []
-    labels: List[Any] = []
-
-    for sample in arr:
-        X_i, y_i = _pick_window_from_container(sample)
-        if X_i is None:
-            continue
-        windows.append(np.asarray(X_i))
-        labels.append(y_i)
-
-    if len(windows) == 0:
-        raise ValueError("Found a 1-D object array but could not extract any (window,label) pairs.")
-
-    fixed = []
-    for w in windows:
-        w = np.asarray(w)
-        if w.ndim == 3 and w.shape[0] == 1:
-            w = w[0]
-        if w.ndim != 2:
-            raise ValueError(f"Each window must be 2D per sample; got shape {w.shape}")
-        fixed.append(w.astype(np.float32))
-    windows = fixed
-
-    try:
-        X = np.stack(windows, axis=0)
-    except Exception:
-        a_shapes = [w.shape for w in windows]
-        fixed2 = []
-        for w in windows:
-            if EXPECTED_T in w.shape and EXPECTED_C in w.shape:
-                if w.shape == (EXPECTED_C, EXPECTED_T):
-                    w = w.T
-            fixed2.append(w)
-        X = np.stack(fixed2, axis=0)
-
-    if any(l is None for l in labels):
-        raise ValueError("Some samples did not include labels; cannot build y vector.")
-    y = np.array(labels)
-
+    LOG_DEBUG(f"After unwrap: X.shape={X.shape}, y.shape={y.shape}, X.ndim={X.ndim}, y.ndim={y.ndim}")
+    if X.shape[1] < X.shape[2]:
+        LOG_WARN("Detected (N,C,T); transposing to (N,T,C).")
+        X = np.transpose(X, (0, 2, 1))
+        LOG_DEBUG(f"After transpose: X.shape={X.shape}")
     return X, y
 
+# ------------ TRAIN / EVAL ------------
+@dataclass
+class TrainConfig:
+    data_path: str
+    seed: int = 42
+    batch_size: int = 64
+    lr: float = 1e-3
+    weight_decay: float = 1e-4
+    max_epochs: int = 60
+    patience: int = 10
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # Defaults to mirror your best run:
+    use_sampler: bool = True          # YES sampler
+    use_focal: bool = False           # CE only
+    gamma_focal: float = 2.0
+    beta_cb: float = 0.9999
+    grad_clip: float = 1.0
+    tau_logit_adjust: float = 0.0     # NO logit adj
+    eval_test_each_epoch: bool = True
+    save_dir: str = 'Classification/models'
+    save_name: str = 'best_cls_lstm.pth'
+    # Model options (mirroring your original arch)
+    conv_norm: str = "batch"
+    k1: int = 15
+    k2: int = 5
+    use_dilation: bool = False
+    use_mha: bool = False
+    lstm_layers: int = 1
 
-def _extract_X_y_from_any(obj: Any) -> Tuple[np.ndarray, np.ndarray]:
-    obj = _unwrap_scalar_ndarray(obj)
+def build_datasets(cfg: TrainConfig):
+    X, y = load_patient_npy(cfg.data_path)
 
-    if isinstance(obj, np.ndarray) and obj.dtype == object and obj.ndim == 1 and obj.size >= 2:
-        return _extract_from_object_samples(obj)
+    # Label distribution (global)
+    counts = np.bincount(y, minlength=len(LABEL_NAMES))
+    label_dist = {LABEL_NAMES[i]: int(counts[i]) for i in range(len(LABEL_NAMES))}
+    LOG_DEBUG(f"Built dataset: X={X.shape}, y={y.shape}, num_channels={X.shape[-1]}")
+    LOG_DEBUG(f"Label distribution: {label_dist}")
 
-    if isinstance(obj, dict):
-        keys = {k.lower(): k for k in obj.keys()}
-        X_keys = ["x", "data", "features", "windows"]
-        y_keys = ["y", "labels", "target", "targets"]
+    # Split (80/10/10)
+    N = X.shape[0]
+    LOG_DEBUG(f"Total windows: {N}")
+    idx = np.arange(N); rng = np.random.default_rng(cfg.seed); rng.shuffle(idx)
+    n_train = int(0.8 * N); n_val = int(0.1 * N)
+    train_idx = idx[:n_train]; val_idx = idx[n_train:n_train + n_val]; test_idx = idx[n_train + n_val:]
+    LOG_DEBUG(f"Train windows: {len(train_idx)}, Val windows: {len(val_idx)}, Test windows: {len(test_idx)}")
 
-        X = y = None
-        for k in X_keys:
-            if k in keys:
-                X = _unwrap_scalar_ndarray(obj[keys[k]])
-                break
-        for k in y_keys:
-            if k in keys:
-                y = _unwrap_scalar_ndarray(obj[keys[k]])
-                break
-        if X is not None and y is not None:
-            return np.asarray(X), np.asarray(y)
+    X_train, y_train = X[train_idx], y[train_idx]
+    X_val,   y_val   = X[val_idx],   y[val_idx]
+    X_test,  y_test  = X[test_idx],  y[test_idx]
 
-    if isinstance(obj, (list, tuple)) and len(obj) >= 2:
-        a = _unwrap_scalar_ndarray(obj[0])
-        b = _unwrap_scalar_ndarray(obj[1])
-        A = np.asarray(a) if isinstance(a, (list, tuple, np.ndarray)) else None
-        B = np.asarray(b) if isinstance(b, (list, tuple, np.ndarray)) else None
-        if A is not None and B is not None:
-            if (A.ndim >= 3 and B.ndim <= 2) or (A.size >= B.size):
-                return A, B
-            else:
-                return B, A
+    # Normalization (train μ,σ)
+    LOG_DEBUG("Normalizing each channel (zero mean, unit std)...")
+    mu, sigma = compute_channel_norm_stats(X_train)
+    X_train_n = apply_channel_norm(X_train, mu, sigma)
+    X_val_n   = apply_channel_norm(X_val,   mu, sigma)
+    X_test_n  = apply_channel_norm(X_test,  mu, sigma)
 
-    if isinstance(obj, np.ndarray) and obj.dtype == object and obj.shape == ():
-        return _extract_X_y_from_any(obj.item())
-
-    arrays: List[np.ndarray] = []
-    _collect_arrays(obj, arrays)
-    three_d = [a for a in arrays if a.ndim == 3]
-    if three_d:
-        X_candidate = max(three_d, key=lambda a: a.size)
-        N = X_candidate.shape[0]
-        y_candidates = [a for a in arrays if a.ndim == 1 and a.shape[0] == N]
-        if y_candidates:
-            return np.asarray(X_candidate), np.asarray(y_candidates[0])
-
-    two_d = [a for a in arrays if a.ndim == 2]
-    if two_d:
-        X_candidate = max(two_d, key=lambda a: a.size)
-        N = X_candidate.shape[0]
-        y_candidates = [a for a in arrays if a.ndim == 1 and a.shape[0] == N]
-        if y_candidates:
-            return np.asarray(X_candidate), np.asarray(y_candidates[0])
-
-    raise ValueError("Could not extract X and y from the provided file. "
-                     "Consider saving as a dict {'X': X, 'y': y} with np.save(..., allow_pickle=True).")
-
-
-def _maybe_fix_axes(X: np.ndarray) -> np.ndarray:
-    if not isinstance(X, np.ndarray):
-        raise ValueError(f"X must be a numpy array, got {type(X)}")
-    if X.ndim == 2:
-        N, D = X.shape
-        if D == EXPECTED_T * EXPECTED_C:
-            print(f"[WARN] Detected flattened windows (N,{D}); reshaping to (N,{EXPECTED_T},{EXPECTED_C}).")
-            return X.reshape(N, EXPECTED_T, EXPECTED_C)
-        raise ValueError(f"X must be 3D (N,T,C) or (N,C,T); got 2D {X.shape}.")
-    if X.ndim != 3:
-        raise ValueError(f"X must be 3D (N,T,C) or (N,C,T), got {X.shape}")
-    n, a, b = X.shape
-    if a == EXPECTED_T and b == EXPECTED_C:
-        return X
-    if a == EXPECTED_C and b == EXPECTED_T:
-        print("[WARN] Detected (N,C,T); transposing to (N,T,C).")
-        return np.transpose(X, (0, 2, 1))
-    return X
-
-
-def _coerce_labels(y: np.ndarray) -> Tuple[np.ndarray, Dict[Any, int]]:
-    if y.ndim != 1:
-        y = y.reshape(-1)
-    if np.issubdtype(y.dtype, np.integer):
-        classes = sorted(np.unique(y).tolist())
-        mapping = {c: int(c) for c in classes}
-        return y.astype(np.int64), mapping
-    uniq = list(map(lambda z: z if isinstance(z, str) else str(z), np.unique(y)))
-    order = KNOWN_LABELS if set(uniq) == set(KNOWN_LABELS) else sorted(uniq)
-    str2id = {s: i for i, s in enumerate(order)}
-    y_int = np.array([str2id[str(v)] for v in y], dtype=np.int64)
-    return y_int, str2id
-
-
-def load_dataset(path: str) -> Tuple[np.ndarray, np.ndarray, Dict[Any, int]]:
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Dataset not found: {path}")
-
-    loaded = np.load(path, allow_pickle=True)
-    print(f"[DEBUG] Loading {path}")
-    print(f"[DEBUG] Raw top-level: type={type(loaded)}, "
-          f"shape={getattr(loaded, 'shape', None)}, dtype={getattr(loaded, 'dtype', None)}")
-
-    if isinstance(loaded, np.lib.npyio.NpzFile):
-        X = _unwrap_scalar_ndarray(loaded["X"])
-        y = _unwrap_scalar_ndarray(loaded["y"])
-        loaded.close()
-    else:
-        X, y = _extract_X_y_from_any(loaded)
-
-    if isinstance(X, (list, tuple)):
-        X = np.array(X)
-    if isinstance(y, (list, tuple)):
-        y = np.array(y)
-
-    X = np.asarray(X)
-    y = np.asarray(y)
-    print(f"[DEBUG] After unwrap: X.shape={getattr(X, 'shape', None)}, y.shape={getattr(y, 'shape', None)}, "
-          f"X.ndim={getattr(X, 'ndim', None)}, y.ndim={getattr(y, 'ndim', None)}")
-
-    X = _maybe_fix_axes(X)
-    y_int, mapping = _coerce_labels(y)
-
-    if X.shape[0] != y_int.shape[0]:
-        raise ValueError(f"N mismatch: X={X.shape[0]} vs y={y_int.shape[0]}")
-
-    X = X.astype(np.float32)
-    y_int = y_int.astype(np.int64)
-    return X, y_int, mapping
-
-
-# ===============================
-# Torch dataset / training
-# ===============================
-class WindowDataset(Dataset):
-    def __init__(self, X: np.ndarray, y: np.ndarray, mean=None, std=None):
-        self.X = X
-        self.y = y
-        if mean is None or std is None:
-            mean = X.mean(axis=(0, 1))
-            std = X.std(axis=(0, 1)) + 1e-8
-        self.mean = mean.astype(np.float32)
-        self.std = std.astype(np.float32)
-
-    def __len__(self): return self.X.shape[0]
-
-    def __getitem__(self, idx: int):
-        x = (self.X[idx] - self.mean) / self.std
-        return torch.from_numpy(x), torch.tensor(self.y[idx], dtype=torch.long)
-
-
-def _build_sampler(y_train: np.ndarray):
-    classes, counts = np.unique(y_train, return_counts=True)
-    total = len(y_train)
-    weight_per_class = {c: total / (len(classes) * cnt) for c, cnt in zip(classes, counts)}
-    sample_weights = np.array([weight_per_class[c] for c in y_train], dtype=np.float32)
-    weights_list = [weight_per_class[c] for c in sorted(weight_per_class.keys())]
-    print(f"[DEBUG] Class weights (balanced sampler): {weights_list}")
-    return WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
-
-
-def _evaluate(model, loader, device):
-    model.eval()
-    preds, trues = [], []
-    with torch.no_grad():
-        for xb, yb in loader:
-            logits = model(xb.to(device))
-            preds.append(torch.argmax(logits, dim=1).cpu().numpy())
-            trues.append(yb.numpy())
-    y_pred = np.concatenate(preds)
-    y_true = np.concatenate(trues)
-    acc = accuracy_score(y_true, y_pred)
-    f1m = f1_score(y_true, y_pred, average="macro")
-    return acc, f1m, y_true, y_pred
-
-
-def _print_channel_norm_debug(X: np.ndarray, mean: np.ndarray, std: np.ndarray):
-    print("[DEBUG] Normalizing each channel (zero mean, unit std)...")
-    normed = (X - mean) / std
-    C = normed.shape[2]
+    # Print per-channel stats AFTER applying (for parity with your logs)
+    X_all_n = np.concatenate([X_train_n, X_val_n, X_test_n], axis=0)
+    C = X_all_n.shape[-1]
     for c in range(C):
-        mu = normed[:, :, c].mean()
-        sg = normed[:, :, c].std()
-        print(f"[DEBUG] Channel {c}: mean={mu:+.3f}, std={sg:.3f}")
+        m = X_all_n[:, :, c].mean(); s = X_all_n[:, :, c].std()
+        LOG_DEBUG(f"Channel {c}: mean={m:+0.3f}, std={s:0.3f}")
 
+    ds_train = NPWindowDataset(X_train_n, y_train)
+    ds_val   = NPWindowDataset(X_val_n,   y_val)
+    ds_test  = NPWindowDataset(X_test_n,  y_test)
 
-def _stratified_80_10_10(X: np.ndarray, y: np.ndarray, seed: int):
-    n = X.shape[0]
-    val_cnt = int(np.ceil(n * 0.10))
-    test_cnt = int(np.ceil(n * 0.10))
-    tv_cnt = val_cnt + test_cnt
+    stats = {'mu': mu.tolist(), 'sigma': sigma.tolist(),
+             'class_counts': np.bincount(y_train, minlength=len(LABEL_NAMES)).tolist()}
+    return ds_train, ds_val, ds_test, stats
 
-    sss = StratifiedShuffleSplit(n_splits=1, test_size=tv_cnt, random_state=seed)
-    train_idx, tv_idx = next(sss.split(X, y))
+def make_loader(dataset: Dataset, cfg: TrainConfig, class_counts: Optional[np.ndarray] = None, shuffle: bool = True):
+    if cfg.use_sampler and class_counts is not None:
+        class_counts = np.asarray(class_counts, dtype=np.float64)
+        class_weights = class_counts.sum() / np.maximum(class_counts, 1.0)
+        sample_weights = class_weights[dataset.y.numpy()]
+        sampler = WeightedRandomSampler(sample_weights, num_samples=len(dataset), replacement=True)
+        LOG_DEBUG(f"Class weights (balanced sampler): {class_weights.tolist()}")
+        return DataLoader(dataset, batch_size=cfg.batch_size, sampler=sampler, num_workers=2, pin_memory=True)
+    return DataLoader(dataset, batch_size=cfg.batch_size, shuffle=shuffle, num_workers=2, pin_memory=True)
 
-    # Split tv_idx into val and test with exact counts
-    X_tv = X[tv_idx]
-    y_tv = y[tv_idx]
-    sss2 = StratifiedShuffleSplit(n_splits=1, test_size=test_cnt, random_state=seed)
-    val_idx_local, test_idx_local = next(sss2.split(X_tv, y_tv))
-    val_idx = tv_idx[val_idx_local]
-    test_idx = tv_idx[test_idx_local]
-    return train_idx, val_idx, test_idx
+@torch.no_grad()
+def evaluate(model: nn.Module, loader: DataLoader, device: str, tau: float, priors_log: Optional[torch.Tensor] = None):
+    model.eval()
+    all_logits, all_targets = [], []
+    for xb, yb in loader:
+        xb = xb.to(device); yb = yb.to(device)
+        logits = model(xb)
+        if priors_log is not None and tau is not None and tau > 1e-9:
+            logits = logits - tau * priors_log
+        all_logits.append(logits.cpu()); all_targets.append(yb.cpu())
+    logits  = torch.cat(all_logits)
+    targets = torch.cat(all_targets)
+    preds   = logits.argmax(dim=1)
+    acc     = accuracy_score(targets.numpy(), preds.numpy())
+    macro_f1= f1_score(targets.numpy(), preds.numpy(), average='macro')
+    return acc, macro_f1, targets.numpy(), preds.numpy()
 
+def train(cfg: TrainConfig):
+    set_seed(cfg.seed)
 
-def run_training(
-    patient_id: str,
-    npy_path: str,
-    batch_size: int = 64,
-    lr: float = 5e-4,
-    epochs: int = 60,
-    device: str = "cpu",
-    save_path: str = os.path.join("Classification", "models", "best_cls_lstm.pth"),
-    seed: int = 42,
-    early_stop_patience: int = 10
-):
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    ds_train, ds_val, ds_test, stats = build_datasets(cfg)
+    class_counts = np.bincount(ds_train.y.numpy(), minlength=len(LABEL_NAMES))
 
-    print(f"[DEBUG] Training on patient: {patient_id}")
-    X, y, mapping = load_dataset(npy_path)
-    n, T, C = X.shape
-    print(f"[DEBUG] Built dataset: X={X.shape}, y={y.shape}, num_channels={C}")
+    # Priors (for optional logit adjust – default off)
+    priors = class_counts / class_counts.sum()
+    priors_log = torch.log(torch.tensor(priors, dtype=torch.float32)).to(cfg.device)
 
-    inv_map = {v: k for k, v in mapping.items()}
-    labels_print = [inv_map[int(k)] if int(k) in inv_map else int(k) for k in np.unique(y)]
-    counts = [int((y == k).sum()) for k in np.unique(y)]
-    print(f"[DEBUG] Label distribution: {dict(zip(labels_print, counts))}")
-    print(f"[DEBUG] Total windows: {n}")
+    train_loader = make_loader(ds_train, cfg, class_counts, shuffle=True)
+    val_loader   = make_loader(ds_val,   cfg, class_counts=None, shuffle=False)
+    test_loader  = make_loader(ds_test,  cfg, class_counts=None, shuffle=False)
 
-    train_idx, val_idx, test_idx = _stratified_80_10_10(X, y, seed=seed)
-    print(f"[DEBUG] Train windows: {len(train_idx)}, Val windows: {len(val_idx)}, Test windows: {len(test_idx)}")
+    model = LSTMClassifier(
+        num_channels=ds_train.X.shape[-1], num_classes=len(LABEL_NAMES),
+        lstm_hidden=128, lstm_layers=cfg.lstm_layers,
+        use_mha=cfg.use_mha, conv_norm=cfg.conv_norm,
+        k1=cfg.k1, k2=cfg.k2, use_dilation=cfg.use_dilation
+    ).to(cfg.device)
 
-    # Train stats
-    train_mean = X[train_idx].mean(axis=(0, 1))
-    train_std  = X[train_idx].std(axis=(0, 1)) + 1e-8
+    LOG_DEBUG(f"Model Architecture: {model.__class__.__name__}(\n  (conv1): Conv1d({ds_train.X.shape[-1]}, {ds_train.X.shape[-1]}, kernel_size=({cfg.k1},), stride=(1,))\n  (bn1): BatchNorm1d({ds_train.X.shape[-1]})\n  (conv2): Conv1d({ds_train.X.shape[-1]}, {ds_train.X.shape[-1]}, kernel_size=({cfg.k2},), stride=(1,))\n  (bn2): BatchNorm1d({ds_train.X.shape[-1]})\n  (pool): MaxPool1d(kernel_size=2, stride=2)\n  (lstm): LSTM({ds_train.X.shape[-1]}, 128, batch_first=True, bidirectional=True)\n  (attn): Sequential(\n    (0): Linear(in_features=256, out_features=64, bias=True)\n    (1): Tanh()\n    (2): Linear(in_features=64, out_features=1, bias=True)\n  )\n  (fc_hidden): Linear(in_features=256, out_features=128, bias=True)\n  (dropout_fc): Dropout(p=0.5, inplace=False)\n  (fc_out): Linear(in_features=128, out_features={len(LABEL_NAMES)}, bias=True)\n)")
 
-    # Debug print per-channel normalization like the best run
-    _print_channel_norm_debug(X, train_mean, train_std)
+    # Loss: כש-sampler פעיל -> בלי משקולות בכרוס-אנטרופי (כדי לא להכפיל איזון)
+    alpha_cb = class_balanced_alpha(ds_train.y.numpy(), num_classes=len(LABEL_NAMES), beta=cfg.beta_cb).to(cfg.device)
+    if cfg.use_sampler:
+        criterion = nn.CrossEntropyLoss(weight=None)
+    else:
+        criterion = nn.CrossEntropyLoss(weight=alpha_cb)
 
-    ds_train = WindowDataset(X[train_idx], y[train_idx], mean=train_mean, std=train_std)
-    ds_val   = WindowDataset(X[val_idx],   y[val_idx],   mean=train_mean, std=train_std)
-    ds_test  = WindowDataset(X[test_idx],  y[test_idx],  mean=train_mean, std=train_std)
-
-    sampler  = _build_sampler(y[train_idx])
-    dl_train = DataLoader(ds_train, batch_size=batch_size, sampler=sampler, num_workers=0)
-    dl_val   = DataLoader(ds_val,   batch_size=batch_size, shuffle=False, num_workers=0)
-    dl_test  = DataLoader(ds_test,  batch_size=batch_size, shuffle=False, num_workers=0)
-
-    model = LSTMClassifier(in_channels=C, lstm_hidden=128, num_classes=len(np.unique(y)), dropout_p=0.5).to(device)
-    print("[DEBUG] Model Architecture:", model)
-
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3, verbose=True)
 
     best_f1 = -1.0
-    best_state = None
-    last_improve = 0
+    epochs_no_improve = 0
+    os.makedirs(cfg.save_dir, exist_ok=True)
+    ckpt_path = os.path.join(cfg.save_dir, cfg.save_name)
 
-    for epoch in range(1, epochs + 1):
-        model.train()
-        total_loss = 0.0
-        for xb, yb in dl_train:
-            xb, yb = xb.to(device), yb.to(device)
-            optimizer.zero_grad()
-            loss = criterion(model(xb), yb)
+    for epoch in range(1, cfg.max_epochs + 1):
+        model.train(); running_loss = 0.0
+        for xb, yb in train_loader:
+            xb = xb.to(cfg.device); yb = yb.to(cfg.device)
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(xb)
+            loss = criterion(logits, yb)
             loss.backward()
+            if cfg.grad_clip is not None:
+                nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             optimizer.step()
-            total_loss += loss.item() * xb.size(0)
-        train_loss = total_loss / len(ds_train)
+            running_loss += loss.item() * xb.size(0)
 
-        test_acc, _, _, _ = _evaluate(model, dl_test, device)
-        val_acc, val_f1, _, _ = _evaluate(model, dl_val, device)
+        train_loss = running_loss / len(ds_train)
+        print(f"Epoch [{epoch}/{cfg.max_epochs}]  Loss: {train_loss:.4f}")
 
-        print(f"Epoch [{epoch}/{epochs}], Loss: {train_loss:.4f}")
-        print(f"[DEBUG] Epoch {epoch}: Test Accuracy = {test_acc*100:.2f}%")
-        print(f"[DEBUG] Epoch {epoch}: Val Macro-F1 = {val_f1*100:.2f}%")
+        # Logs כמו במקור
+        if cfg.eval_test_each_epoch:
+            test_acc_e, _, _, _ = evaluate(model, test_loader, cfg.device, tau=cfg.tau_logit_adjust, priors_log=priors_log)
+            LOG_DEBUG(f"Epoch {epoch}: Test Accuracy = {test_acc_e*100:.2f}%")
+        _, val_f1_e, _, _ = evaluate(model, val_loader, cfg.device, tau=cfg.tau_logit_adjust, priors_log=priors_log)
+        LOG_DEBUG(f"Epoch {epoch}: Val Macro-F1 = {val_f1_e*100:.2f}%")
 
-        if val_f1 > best_f1 + 1e-8:
-            best_f1 = val_f1
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            last_improve = epoch
+        scheduler.step(val_f1_e)
 
-        if epoch - last_improve >= early_stop_patience:
-            print(f"[DEBUG] Early stopping at epoch {epoch} (no improvement in {early_stop_patience} epochs).")
-            break
+        if val_f1_e > best_f1 + 1e-6:
+            best_f1 = val_f1_e
+            epochs_no_improve = 0
+            torch.save({'model_state': model.state_dict(), 'cfg': cfg.__dict__, 'stats': stats, 'label_names': LABEL_NAMES}, ckpt_path)
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= cfg.patience:
+                LOG_DEBUG(f"Early stopping at epoch {epoch} (no improvement in {cfg.patience} epochs).")
+                break
 
-    if best_state is not None:
-        model.load_state_dict(best_state)
+    print(f"Saved checkpoint to: { _normpath(ckpt_path) }")
 
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    torch.save(model.state_dict(), save_path)
-    print(f"Saved checkpoint to: {save_path}")
+    state = torch.load(ckpt_path, map_location=cfg.device)
+    model.load_state_dict(state['model_state'])
 
-    test_acc, _, y_true, y_pred = _evaluate(model, dl_test, device)
-    cm = confusion_matrix(y_true, y_pred)
-
-    # Pretty target names in the same order as class indices
-    class_indices = sorted(np.unique(y_true).tolist())
-    target_names = [str(inv_map[c]) if c in inv_map else str(c) for c in class_indices]
-    report = classification_report(y_true, y_pred, digits=3, target_names=target_names)
-
-    correct = int(test_acc * len(y_true))
-    print(f"Test Accuracy: {test_acc*100:.2f}% ({correct}/{len(y_true)} windows correct)")
-    print("Confusion Matrix:\n", cm)
-    print("Classification Report:\n", report)
-
-    return test_acc, best_f1
+    test_acc, test_f1, y_true, y_pred = evaluate(model, test_loader, cfg.device, tau=cfg.tau_logit_adjust, priors_log=priors_log)
+    correct = int((y_true == y_pred).sum()); total = int(len(y_true))
+    print(f"Test Accuracy: {test_acc*100:.2f}% ({correct}/{total} windows correct)")
+    print("Confusion Matrix:\n", confusion_matrix(y_true, y_pred))
+    print("Classification Report:\n", classification_report(y_true, y_pred, target_names=LABEL_NAMES, digits=4))
+    return ckpt_path

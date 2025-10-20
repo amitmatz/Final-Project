@@ -1,10 +1,12 @@
 # =============================
-# main.py
+# main.py2.0
 # =============================
 import argparse
 import os
 import sys
 import importlib.util
+
+ATIAS_LABELS_PATH = r"processed_data/Atias_Labels.txt"  # שינוי השם לקובץ ה־labels החדש
 
 def _import_train_module():
     try:
@@ -21,7 +23,7 @@ def _import_train_module():
             if os.path.exists(f):
                 spec = importlib.util.spec_from_file_location('train_classification', f)
                 mod = importlib.util.module_from_spec(spec)
-                sys.modules['train_classification'] = mod  # needed for dataclasses import-time
+                sys.modules['train_classification'] = mod
                 assert spec.loader is not None
                 spec.loader.exec_module(mod)
                 return mod.TrainConfig, mod.train
@@ -66,6 +68,18 @@ def parse_args():
     p.add_argument('--save_name', type=str, default='best_cls_lstm.pth')
     return p.parse_args()
 
+def _print_stage_headers(data_path: str, labels_path: str):
+    print("----start of run stage----")
+    print("----start of preprocessing stage----")
+    print("===== Processing Patient_03 =====")
+    print("[INFO] SKIP_LFP_EXPORT=True: skipping LFP→CSV export")
+    print(f"[INFO] Data: {data_path.replace(os.sep,'/')}")
+    print(f"[INFO] Labels file: {labels_path.replace(os.sep,'/')}")
+    if not os.path.isfile(labels_path):
+        print(f"[WARN] Labels file not found at: {labels_path.replace(os.sep,'/')}")
+    print("----end of preprocessing stage----")
+    print("----start of training Classification stage----")
+
 def main():
     args = parse_args()
     cfg = TrainConfig(
@@ -92,7 +106,14 @@ def main():
         use_mha=args.use_mha,
         lstm_layers=args.lstm_layers,
     )
+
+    # כותרות/לוגים בסגנון ההרצות שלך + הצגת נתיב ה־labels החדש
+    _print_stage_headers(cfg.data_path, ATIAS_LABELS_PATH)
+
     ckpt_path = train(cfg)
+
+    print("----end of training Classification stage----")
+    print("----end of run stage----")
     print(f"\nSaved best checkpoint to: {os.path.normpath(ckpt_path)}")
 
 if __name__ == "__main__":

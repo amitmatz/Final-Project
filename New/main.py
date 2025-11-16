@@ -1,214 +1,163 @@
 # main.py
 import argparse
+import logging
+import os
+import sys
+import subprocess
 from pathlib import Path
-from typing import List, Dict, Any
-from inspect import signature
+from typing import Tuple, Optional, List, Dict, Any
 
-from preprocessing.preprocessing import process_patient, PreprocConfig
+# --- Logging setup ---
+LOG_FORMAT = "%(levelname)s: %(message)s"
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+logger = logging.getLogger(__name__)
+
+# --- Shared paths ---
+from defines import PROCESSED_DATA_DIR
+
+# --- Training module ---
+# Make sure the folder name 'Classification' matches your actual folder name.
 from Classification.train_classification import TrainConfig, train
 
 
-# ---------- small utils ----------
-
-def parse_tau_grid(s: str) -> List[float]:
-    s = s.strip()
-    if not s:
-        return [0.0]
-    parts = [p for p in s.split(",") if p != ""]
-    return [float(p) for p in parts]
-
-
-def filter_kwargs_for_ctor(ctor, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+def _run_preprocessing(patient_id: str, force: bool = False) -> None:
     """
-    Keep only kwargs that actually appear in the constructor's signature.
-    If anything goes wrong, return {} so the caller can try zero-arg construction.
+    Run the preprocessing *script* preprocessing/preprocessing.py as a separate
+    Python process, passing all required arguments via the command line.
+
+    This does NOT import any function from preprocessing; it just executes the file.
     """
-    try:
-        params = signature(ctor).parameters
-        return {k: v for k, v in kwargs.items() if k in params}
-    except Exception:
-        return {}
+    # Path to preprocessing script
+    root = Path(__file__).parent.resolve()
+    script_path = root / "preprocessing" / "preprocessing.py"
+
+    if not script_path.exists():
+        logger.info("preprocessing.py not found at %s. Skipping preprocessing.", script_path)
+        return
+
+    # Output paths must match what training expects
+    PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    out_data_path = PROCESSED_DATA_DIR / f"{patient_id}_classification_data.npy"
+    out_splits_path = PROCESSED_DATA_DIR / f"{patient_id}_splits.json"
+
+    # Build command line to run the script
+    cmd: List[str] = [
+        sys.executable,
+        str(script_path),
+        "--patient_id",
+        patient_id,
+        "--out_data",
+        str(out_data_path),
+        "--out_splits",
+        str(out_splits_path),
+    ]
+    if force:
+        cmd.append("--force")
+
+    logger.info("Running preprocessing script: %s", " ".join(cmd))
+
+    # If preprocessing fails, raise an error so we see why.
+    subprocess.check_call(cmd)
 
 
-def try_construct(ctor, **kwargs):
+def build_paths(patient_id: str) -> Tuple[str, str]:
     """
-    Try to construct an object from `ctor` with only the supported kwargs.
-    If that fails, try zero-arg construction. If that also fails, re-raise.
+    Compute default data/splits paths used by TrainConfig and logs.
+    Uses the same PROCESSED_DATA_DIR as defines.py to stay consistent.
     """
-    filt = filter_kwargs_for_ctor(ctor, kwargs)
-    try:
-        return ctor(**filt)
-    except Exception:
-        try:
-            return ctor()  # maybe it's a no-arg dataclass or simple object
-        except Exception as e:
-            raise e
+    processed_dir = PROCESSED_DATA_DIR
+    processed_dir.mkdir(parents=True, exist_ok=True)
+
+    data_path = processed_dir / f"{patient_id}_classification_data.npy"
+    splits_path = processed_dir / f"{patient_id}_splits.json"
+    return str(data_path), str(splits_path)
 
 
-def safe_process_patient(pre_cfg, patient_id: str, force: bool):
-    """
-    Call process_patient with whatever signature exists locally.
-    Tries common signatures to stay compatible.
-    """
-    print(f"[INFO] Running preprocessing for {patient_id} ...")
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="Final Project — Classification Trainer")
+    p.add_argument("--patient_id", required=True, help="Patient ID, e.g., Patient_03")
+    p.add_argument("--force_preproc", action="store_true", help="Force preprocessing before training")
+    p.add_argument("--cv_folds", type=int, default=5, help="Number of CV folds (default: 5)")
 
-    # (patient_id, pre_cfg, force=...)
-    try:
-        return process_patient(patient_id, pre_cfg, force=force)
-    except TypeError:
-        pass
-    # (pre_cfg, patient_id, force=...)
-    try:
-        return process_patient(pre_cfg, patient_id, force=force)
-    except TypeError:
-        pass
-    # (patient_id, pre_cfg)
-    try:
-        return process_patient(patient_id, pre_cfg)
-    except TypeError:
-        pass
-    # (pre_cfg) only
-    return process_patient(pre_cfg)
-
-
-# ---------- CLI ----------
-
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser()
-    # required
-    p.add_argument("--patient_id", required=True, help="e.g., Patient_03")
-
-    # device
-    p.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
-
-    # preprocessing (נעשה פילטרינג דינמי בהמשך)
-    p.add_argument("--force_preproc", action="store_true")
-    p.add_argument("--apply_notch50", action="store_true")
-    p.add_argument("--bp_low_hz", type=int, default=1)
-    p.add_argument("--bp_high_hz", type=int, default=150)
-    p.add_argument("--window_ms", type=int, default=1000)
-    p.add_argument("--other_margin_ms", type=int, default=300)
-    p.add_argument("--other_ratio", type=float, default=1.0)
-
-    # training hparams
-    p.add_argument("--batch_size", type=int, default=64)
-    p.add_argument("--epochs", type=int, default=80)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--weight_decay", type=float, default=1e-4)
-    p.add_argument("--scheduler", choices=["cosine", "plateau"], default="cosine")
-
-    # losses & balancing
-    p.add_argument("--use_focal", action="store_true")
-    p.add_argument("--gamma_focal", type=float, default=1.5)
-    p.add_argument("--label_smoothing", type=float, default=0.0)
-    p.add_argument("--cb_beta", type=float, default=None)  # preferred name
-    p.add_argument("--beta_cb", type=float, default=None)  # alias
-
-    # τ grid
-    p.add_argument("--tau_grid", type=str, default="0,0.25,0.5,0.75,1.0")
-
-    # model
-    p.add_argument("--lstm_layers", type=int, default=2)
-    p.add_argument("--use_dilation", action="store_true")
-    p.add_argument("--conv_norm", choices=["batch", "group"], default="group")
-    p.add_argument("--k1", type=int, default=17)
-    p.add_argument("--k2", type=int, default=5)
-    p.add_argument("--use_mha", action="store_true")  # in case your train supports it
-
-    # regularization & augmentation
-    p.add_argument("--mixup_alpha", type=float, default=0.0)
-    p.add_argument("--time_mask_prob", type=float, default=0.0)
-    p.add_argument("--time_mask_max_ms", type=int, default=120,
-                   help="max time-mask width in milliseconds (fs≈2000Hz)")
-    p.add_argument("--time_mask_max_frac", type=float, default=None)  # legacy, ignored if ms provided
-    p.add_argument("--channel_drop_prob", type=float, default=None)
-    p.add_argument("--chan_drop_prob", type=float, default=None)  # alias
-
-    # exact balanced single batch per epoch
-    p.add_argument("--balanced_one_batch", action="store_true")
-
-    # CV: always on, default 5 folds
-    p.add_argument("--cv_folds", type=int, default=5)
-
-    return p
-
-
-def main():
-    args = build_parser().parse_args()
-
-    # ---------- Preprocessing config (robust to signature changes) ----------
-    pre_cfg_kwargs = dict(
-        apply_notch50=args.apply_notch50,
-        bp_low_hz=args.bp_low_hz,
-        bp_high_hz=args.bp_high_hz,
-        window_ms=args.window_ms,
-        other_margin_ms=args.other_margin_ms,
-        other_ratio=args.other_ratio,
-        patient_id=args.patient_id,  # in case your PreprocConfig supports it
+    # Optional overrides
+    p.add_argument("--batch_size", type=int, default=None)
+    p.add_argument("--epochs", type=int, default=None)  # mapped to max_epochs
+    p.add_argument("--lr", type=float, default=None)
+    p.add_argument(
+        "--keep_channels",
+        type=str,
+        default=None,
+        help="Comma-separated channel indices to keep, e.g. '0,1,2'. If omitted, use all.",
     )
-    pre_cfg = try_construct(PreprocConfig, **pre_cfg_kwargs)
 
-    processed_dir = Path("processed_data")
-    data_path = processed_dir / f"{args.patient_id}_classification_data.npy"
+    return p.parse_args(argv)
 
-    if args.force_preproc or not data_path.exists():
-        safe_process_patient(pre_cfg, args.patient_id, force=args.force_preproc)
-    else:
-        print(f"[INFO] Found existing data at: {data_path} (skip preprocessing)")
 
-    # ---------- Train config (robust to signature changes) ----------
-    # handle alias for class-balanced beta
-    cb_beta_val = args.cb_beta if args.cb_beta is not None else (
-        args.beta_cb if args.beta_cb is not None else 0.9999
-    )
-    # handle alias for channel drop prob
-    ch_drop = args.channel_drop_prob if args.channel_drop_prob is not None else (
-        args.chan_drop_prob if args.chan_drop_prob is not None else 0.0
-    )
-    tau_grid = parse_tau_grid(args.tau_grid)
+def maybe_int_list(csv_str: Optional[str]) -> Optional[List[int]]:
+    if not csv_str:
+        return None
+    out = []
+    for tok in csv_str.split(","):
+        tok = tok.strip()
+        if tok == "":
+            continue
+        out.append(int(tok))
+    return out if out else None
 
-    train_cfg_kwargs = dict(
-        patient_id=args.patient_id,
-        device=args.device,
 
-        # training
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        scheduler=args.scheduler,
+def main(argv=None):
+    args = parse_args(argv)
 
-        # model
-        lstm_layers=args.lstm_layers,
-        conv_norm=args.conv_norm,
-        k1=args.k1,
-        k2=args.k2,
-        use_dilation=args.use_dilation,
-        use_mha=args.use_mha,
+    # Build data/splits default paths (must match preprocessing output)
+    data_path, splits_path = build_paths(args.patient_id)
 
-        # loss
-        use_focal=args.use_focal,
-        gamma_focal=args.gamma_focal,
-        label_smoothing=args.label_smoothing,
-        cb_beta=cb_beta_val,
+    # Optionally run preprocessing as a separate script
+    if args.force_preproc:
+        _run_preprocessing(args.patient_id, force=True)
 
-        # batch policy
-        balanced_one_batch=args.balanced_one_batch,
+    # Sanity checks (not fatal — Train will raise clearer error if missing)
+    if not os.path.isfile(data_path):
+        logger.warning("Expected data file not found: %s", data_path)
+    if not os.path.isfile(splits_path):
+        logger.warning("Expected splits file not found: %s", splits_path)
 
-        # augmentation / regularization
-        time_mask_prob=args.time_mask_prob,
-        time_mask_max_ms=args.time_mask_max_ms,
-        time_mask_max_frac=args.time_mask_max_frac,
-        channel_drop_prob=ch_drop,
-        mixup_alpha=args.mixup_alpha,
+    # Build TrainConfig with ONLY known-safe keys to avoid TypeError on unexpected kwargs
+    cfg_kwargs: Dict[str, Any] = {
+        "data_path": data_path,
+        "splits_path": splits_path,
+        "cv_folds": args.cv_folds,
+    }
 
-        # τ / CV
-        tau_grid=tau_grid,
-        cv_folds=args.cv_folds,
-    )
-    tr_cfg = try_construct(TrainConfig, **train_cfg_kwargs)
+    # Optional overrides (add only if user provided a value)
+    if args.batch_size is not None:
+        cfg_kwargs["batch_size"] = args.batch_size
+    if args.epochs is not None:
+        cfg_kwargs["max_epochs"] = args.epochs
+    if args.lr is not None:
+        cfg_kwargs["lr"] = args.lr
+    keep_ch = maybe_int_list(args.keep_channels)
+    if keep_ch is not None:
+        cfg_kwargs["keep_channels"] = keep_ch
 
-    # ---------- Train (includes CV inside your train()) ----------
+    # Construct config
+    try:
+        tr_cfg = TrainConfig(**cfg_kwargs)
+    except TypeError as e:
+        # Fallback: try with the absolute minimal set if your TrainConfig is stricter
+        logger.warning("TrainConfig(**kwargs) raised %s. Retrying with minimal args.", e)
+        tr_cfg = TrainConfig(data_path=data_path, splits_path=splits_path, cv_folds=args.cv_folds)
+        # Apply optional fields if attributes exist
+        if keep_ch is not None and hasattr(tr_cfg, "keep_channels"):
+            setattr(tr_cfg, "keep_channels", keep_ch)
+        if args.batch_size is not None and hasattr(tr_cfg, "batch_size"):
+            setattr(tr_cfg, "batch_size", args.batch_size)
+        if args.epochs is not None and hasattr(tr_cfg, "max_epochs"):
+            setattr(tr_cfg, "max_epochs", args.epochs)
+        if args.lr is not None and hasattr(tr_cfg, "lr"):
+            setattr(tr_cfg, "lr", args.lr)
+
+    # Kick off training
+    logger.info("Starting training. data_path=%s", tr_cfg.data_path)
     train(tr_cfg)
 
 

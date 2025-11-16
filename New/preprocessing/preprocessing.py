@@ -10,13 +10,22 @@
 
 import os
 import json
+import shutil
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Any
 from pathlib import Path
+import sys
 
 import numpy as np
 import pandas as pd
 import h5py
+
+# ---------------------------------------------------------------------
+# Ensure project root (where defines.py lives) is on sys.path
+# ---------------------------------------------------------------------
+ROOT = Path(__file__).resolve().parent.parent  # one level up from 'preprocessing' folder
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from defines import (
     DATA_BASES_FOR_SEARCH,
@@ -83,29 +92,44 @@ def load_labels_file(labels_path: Path) -> List[Dict[str, Any]]:
         line_idx = 0
         for line in f:
             s = line.strip()
-            if not s or s.startswith("#"): continue
+            if not s or s.startswith("#"):
+                continue
             parts = [p.strip() for p in s.replace(",", "\t").split("\t") if p.strip()]
-            if len(parts) < 3: continue
+            if len(parts) < 3:
+                continue
 
             # A) start, end, label
             if _is_float(parts[0]) and _is_float(parts[1]) and not _is_float(parts[2]):
-                start_sec = float(parts[0]); end_sec = float(parts[1])
-                label = _norm_label(parts[2]); onset_sec = 0.5 * (start_sec + end_sec)
-                events.append({"trial_id": f"trial_{line_idx}", "label": label, "onset_sec": onset_sec})
-                line_idx += 1; continue
+                start_sec = float(parts[0])
+                end_sec = float(parts[1])
+                label = _norm_label(parts[2])
+                onset_sec = 0.5 * (start_sec + end_sec)
+                events.append(
+                    {"trial_id": f"trial_{line_idx}", "label": label, "onset_sec": onset_sec}
+                )
+                line_idx += 1
+                continue
 
             # B) trial_id, label, onset_sec
             if (not _is_float(parts[0])) and _is_float(parts[2]):
-                trial_id = parts[0]; label = _norm_label(parts[1]); onset_sec = float(parts[2])
+                trial_id = parts[0]
+                label = _norm_label(parts[1])
+                onset_sec = float(parts[2])
                 events.append({"trial_id": trial_id, "label": label, "onset_sec": onset_sec})
-                line_idx += 1; continue
+                line_idx += 1
+                continue
 
             # Fallback: if first two look numeric, treat as start/end
             if _is_float(parts[0]) and _is_float(parts[1]):
-                start_sec = float(parts[0]); end_sec = float(parts[1])
-                label = _norm_label(parts[2]); onset_sec = 0.5 * (start_sec + end_sec)
-                events.append({"trial_id": f"trial_{line_idx}", "label": label, "onset_sec": onset_sec})
-                line_idx += 1; continue
+                start_sec = float(parts[0])
+                end_sec = float(parts[1])
+                label = _norm_label(parts[2])
+                onset_sec = 0.5 * (start_sec + end_sec)
+                events.append(
+                    {"trial_id": f"trial_{line_idx}", "label": label, "onset_sec": onset_sec}
+                )
+                line_idx += 1
+                continue
 
             LOG_WARN(f"Skipped label line (unrecognized format): {s}")
 
@@ -155,7 +179,8 @@ def resolve_patient_paths(patient_id: str, patients_config_path: Path) -> Tuple[
 
     LOG_DEBUG(f"Resolved labels: {_norm(labels)}")
     LOG_DEBUG(f"Resolved LFP dir: {_norm(lfp)}")
-    if offset: LOG_DEBUG(f"Resolved offset: {_norm(offset)}")
+    if offset:
+        LOG_DEBUG(f"Resolved offset: {_norm(offset)}")
     return lfp, labels, offset
 
 # ---------------- LFP readers / exporters ----------------
@@ -289,7 +314,7 @@ def stratified_trials_split(events: List[Dict[str, Any]],
         train_ids.extend(ids[end:])
     return train_ids, val_ids, test_ids
 
-# ---------------- Main ----------------
+# ---------------- Main core API ----------------
 def process_patient(patient_id: str,
                     patients_config_path: str = str(PATIENTS_CONFIG_PATH),
                     cfg: Optional[PreprocConfig] = None) -> Tuple[str, str]:
@@ -418,3 +443,32 @@ def process_patient(patient_id: str,
     LOG_INFO(f"Saved {len(items)} windows → {npy_path}")
     LOG_INFO(f"Saved splits → {split_path}")
     return str(npy_path), str(split_path)
+
+# ---------------- CLI entry point (for main.py subprocess) ----------------
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Preprocessing for LFP classification")
+    parser.add_argument("--patient_id", required=True, help="Patient ID, e.g. Patient_03")
+    parser.add_argument("--out_data", type=str, default=None,
+                        help="Output .npy path (main.py passes this, but by default we use PROCESSED_DATA_DIR)")
+    parser.add_argument("--out_splits", type=str, default=None,
+                        help="Output .json splits path (main.py passes this)")
+    parser.add_argument("--force", action="store_true", help="Currently unused; kept for compatibility")
+
+    args = parser.parse_args()
+
+    # Run core pipeline
+    npy_path, split_path = process_patient(args.patient_id)
+
+    # If main.py passed explicit paths and they differ, copy to them
+    if args.out_data is not None:
+        out_data_path = Path(args.out_data)
+        out_data_path.parent.mkdir(parents=True, exist_ok=True)
+        if Path(npy_path).resolve() != out_data_path.resolve():
+            shutil.copy2(npy_path, out_data_path)
+    if args.out_splits is not None:
+        out_splits_path = Path(args.out_splits)
+        out_splits_path.parent.mkdir(parents=True, exist_ok=True)
+        if Path(split_path).resolve() != out_splits_path.resolve():
+            shutil.copy2(split_path, out_splits_path)

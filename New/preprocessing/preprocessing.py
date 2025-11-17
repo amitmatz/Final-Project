@@ -5,7 +5,7 @@
 # - v7.3 MAT reading via h5py (and CSV export per channel)
 # - Per-patient CSV folder to avoid cross-patient mix-ups
 # - Flexible label loader (supports "start end label" and "trial_id label onset")
-# - Trial-based 5/5/5 VAL/TEST split (by label), indices saved to *_splits.json
+# - Trial-based VAL/TEST split, indices saved to *_splits.json
 # - Output: list-of-dicts {signals [T,C], label (str), trial_id}
 
 import os
@@ -14,18 +14,19 @@ import shutil
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Any
 from pathlib import Path
-import sys
+from collections import Counter
 
 import numpy as np
 import pandas as pd
 import h5py
+import sys
 
-# ---------------------------------------------------------------------
-# Ensure project root (where defines.py lives) is on sys.path
-# ---------------------------------------------------------------------
-ROOT = Path(__file__).resolve().parent.parent  # one level up from 'preprocessing' folder
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+# ---------------- Ensure project root is on sys.path ----------------
+# So that "from defines import ..." works when running this file as a script
+THIS_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = THIS_DIR.parent  # root folder "New"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from defines import (
     DATA_BASES_FOR_SEARCH,
@@ -409,6 +410,14 @@ def process_patient(patient_id: str,
             if x is None:
                 continue
             items.append({"signals": x.astype(np.float32), "label": "OTHER", "trial_id": f"OTHER_{c}"})
+
+    # -------- Debug: class counts before splits --------
+    label_counts = Counter(it["label"] for it in items)
+    LOG_INFO("Class counts in preprocessing (before splits):")
+    for lbl in ["HAARYE", "OTHER", "TUT"]:
+        LOG_INFO(f"  {lbl}: {label_counts.get(lbl, 0)}")
+    LOG_INFO(f"Total windows: {len(items)}")
+    # ---------------------------------------------------
 
     # Trial-based splits
     train_ids, val_ids, test_ids = stratified_trials_split(

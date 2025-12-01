@@ -1,483 +1,640 @@
-# -*- coding: utf-8 -*-
-# preprocessing/preprocessing.py
-# End-to-end preprocessing for LFP classification (paths via defines.py):
-# - Robust path resolution using defines.DATA_BASES_FOR_SEARCH
-# - v7.3 MAT reading via h5py (and CSV export per channel)
-# - Per-patient CSV folder to avoid cross-patient mix-ups
-# - Flexible label loader (supports "start end label" and "trial_id label onset")
-# - Trial-based VAL/TEST split, indices saved to *_splits.json
-# - Output: list-of-dicts {signals [T,C], label (str), trial_id}
-
-import os
+import argparse
 import json
-import shutil
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional, Any
+import logging
+import os
 from pathlib import Path
-from collections import Counter
+from typing import List, Dict, Any, Tuple, Optional
 
-import numpy as np
-import pandas as pd
 import h5py
-import sys
+import numpy as np
 
-# ---------------- Ensure project root is on sys.path ----------------
-# So that "from defines import ..." works when running this file as a script
-THIS_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = THIS_DIR.parent  # root folder "New"
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+# -----------------------------------------------------------------------------
+# Logging setup
+# -----------------------------------------------------------------------------
+logger = logging.getLogger("preprocessing")
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
-from defines import (
-    DATA_BASES_FOR_SEARCH,
-    PATIENTS_CONFIG_PATH,
-    PROCESSED_DATA_DIR,
-)
 
-# ---------------- Logging ----------------
-def LOG_INFO(msg: str):  print(f"[INFO] {msg}")
-def LOG_DEBUG(msg: str): print(f"[DEBUG] {msg}")
-def LOG_WARN(msg: str):  print(f"[WARN] {msg}")
-def LOG_ERR(msg: str):   print(f"[ERROR] {msg}")
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+DATA_BASES_FOR_SEARCH = [
+    # Local repo copy
+    str(Path(__file__).resolve().parents[1] / "Data"),
+    # Google Drive copy
+    r"G:\My Drive\FinalProject\Data",
+]
 
-def _norm(p: Path) -> str:
-    try:
-        return str(p.resolve())
-    except Exception:
-        return str(p)
 
-# ---------------- Labels map ----------------
-def _norm_label(s: str) -> str:
-    up = (s or "").strip().upper()
-    if up.startswith("HAARY"): return "HAARYE"
-    if up in {"TUT", "TUT.", "TUT,"}: return "TUT"
-    if up in {"האריה"}: return "HAARYE"
-    if up in {"תות"}:   return "TUT"
+# -----------------------------------------------------------------------------
+# Label normalization
+# -----------------------------------------------------------------------------
+def normalize_label(label_str: str) -> str:
+    """
+    Normalize raw label string into one of: 'HAARYE', 'TUT', 'OTHER'.
+
+    IMPORTANT for you:
+    - HAARYE stays HAARYE
+    - TUT stays TUT
+    - AHAV (אהב) is mapped to OTHER
+    - Any other speech word → OTHER
+    """
+    if label_str is None:
+        return "OTHER"
+
+    s = str(label_str).strip().upper()
+
+    # "HAARYE" / ARYE variants
+    if "HAARYE" in s or "HARIE" in s or "ARYE" in s or "ARIE" in s:
+        return "HAARYE"
+
+    # "TUT" variants
+    if "TUT" in s:
+        return "TUT"
+
+    # Explicitly treat AHAV as OTHER (but functionally any non-HAARYE/TUT
+    # will also fall to OTHER)
+    if "AHAV" in s:
+        return "OTHER"
+
+    # Everything else is OTHER
     return "OTHER"
 
-# ---------------- Config ----------------
-@dataclass
-class PreprocConfig:
-    sample_rate: float = 2000.0
-    window_size_ms: int = 500
-    other_stride_ms: int = 500
-    other_margin_ms: int = 250
-    other_ratio: float = 1.0
-    per_class_test: int = 5
-    per_class_val: int = 5
-    seed: int = 42
-    # CSV export
-    do_export_csv: bool = True
-    csv_root_dirname: str = "csvs"  # under PROCESSED_DATA_DIR
 
-# ---------------- Helpers: labels ----------------
-def _is_float(x: str) -> bool:
-    try:
-        float(x); return True
-    except Exception:
-        return False
+# -----------------------------------------------------------------------------
+# Path resolution helpers
+# -----------------------------------------------------------------------------
+def _log_resolve_attempt(base: str, rel: str, exists: bool) -> None:
+    status = "[OK]" if exists else "[missing]"
+    logger.debug(f"  Base: {base}\n    -> {os.path.join(base, rel)} {status}")
 
-def load_labels_file(labels_path: Path) -> List[Dict[str, Any]]:
+
+def resolve_in_bases(relative_path: str) -> str:
     """
-    Supports BOTH:
-      A) start<TAB>end<TAB>label
-      B) trial_id<TAB>label<TAB>onset_sec
-    Returns: list of {trial_id, label, onset_sec}
+    Search for `relative_path` under all DATA_BASES_FOR_SEARCH bases.
+    Returns the first existing path, or raises FileNotFoundError.
+    """
+    logger.info("Resolving data paths (searching DATA_BASES_FOR_SEARCH):")
+    for base in DATA_BASES_FOR_SEARCH:
+        candidate = os.path.join(base, relative_path)
+        exists = os.path.exists(candidate)
+        _log_resolve_attempt(base, relative_path, exists)
+        if exists:
+            return candidate
+    raise FileNotFoundError(
+        f"Could not resolve path '{relative_path}' under any of DATA_BASES_FOR_SEARCH"
+    )
+
+
+def build_patient_rel_paths(patient_id: str) -> Tuple[str, str, str]:
+    """
+    Build relative paths for:
+      - Atias_Labels.txt
+      - LFP_signals dir
+      - sound_w_times.mat
+    Pattern: Patient_03/pt3_LFP_sound/...
+    """
+    try:
+        num_str = patient_id.split("_")[1]
+        num_int = int(num_str)
+    except Exception:
+        raise ValueError(f"Invalid patient_id format: {patient_id}. Expected 'Patient_XX'.")
+
+    session_dir_name = f"pt{num_int}_LFP_sound"
+
+    rel_labels = os.path.join(patient_id, session_dir_name, "Atias_Labels.txt")
+    rel_lfp_dir = os.path.join(patient_id, session_dir_name, "LFP_signals")
+    rel_offset = os.path.join(patient_id, session_dir_name, "sound_w_times.mat")
+
+    return rel_labels, rel_lfp_dir, rel_offset
+
+
+# -----------------------------------------------------------------------------
+# HDF5 helpers
+# -----------------------------------------------------------------------------
+def _iter_datasets(h5obj, path: str = ""):
+    """
+    Recursively yield (path, dataset) for all h5py.Dataset objects under h5obj.
+    """
+    if isinstance(h5obj, h5py.Dataset):
+        yield path, h5obj
+    elif isinstance(h5obj, h5py.Group):
+        for key in h5obj.keys():
+            sub = h5obj[key]
+            sub_path = f"{path}/{key}" if path else key
+            yield from _iter_datasets(sub, sub_path)
+
+
+def _choose_largest_numeric_dataset(f: h5py.File) -> h5py.Dataset:
+    """
+    Choose the largest numeric dataset in the file.
+
+    This is robust: the continuous LFP signal is always the biggest dataset.
+    Small metadata arrays (like 2 samples) will not be chosen.
+    """
+    candidates = []
+    for path, ds in _iter_datasets(f):
+        if not np.issubdtype(ds.dtype, np.number):
+            continue
+        size = ds.size
+        candidates.append((size, path, ds))
+
+    if not candidates:
+        raise RuntimeError("No numeric datasets found in MAT file.")
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    size, path, ds = candidates[0]
+    logger.debug(f"[DEBUG] Selected dataset '{path}' with shape {ds.shape}, size={size}")
+    return ds
+
+
+# -----------------------------------------------------------------------------
+# Data loading
+# -----------------------------------------------------------------------------
+def load_lfp_signals_from_mat_dir(lfp_dir: str) -> Tuple[np.ndarray, float, List[str]]:
+    """
+    Load LFP signals from a directory of CSC*_LFP.mat files (MAT v7.3, h5py).
+
+    Returns:
+        signals: np.ndarray, shape (n_channels, n_samples)
+        fs: float, sampling rate (Hz)
+        channel_names: List[str]
+    """
+    lfp_dir_path = Path(lfp_dir)
+    mat_files = sorted(lfp_dir_path.glob("CSC*_LFP.mat"))
+
+    if not mat_files:
+        raise FileNotFoundError(f"No CSC*_LFP.mat files found in {lfp_dir}")
+
+    all_signals: List[np.ndarray] = []
+    channel_names: List[str] = []
+
+    fs = 2000.0  # as seen in your logs
+
+    for mat_file in mat_files:
+        with h5py.File(mat_file, "r") as f:
+            data_ds = _choose_largest_numeric_dataset(f)
+            data = np.array(data_ds[()], dtype=np.float32)
+
+            if data.ndim > 1:
+                data = data.reshape(-1)
+
+        n_samples = data.shape[0]
+        duration_sec = n_samples / fs
+        channel_name = mat_file.stem  # e.g., "CSC10_LFP"
+
+        logger.info(
+            "[EXPORT] %s.mat: %d samples @ %.2f Hz → %.3fs",
+            channel_name,
+            n_samples,
+            fs,
+            duration_sec,
+        )
+
+        all_signals.append(data)
+        channel_names.append(channel_name)
+
+    signals = np.stack(all_signals, axis=0)  # [n_channels, n_samples]
+    return signals, fs, channel_names
+
+
+def load_label_events(labels_path: str) -> List[Dict[str, Any]]:
+    """
+    Load label events from Atias_Labels.txt.
+
+    Assumed formats (tries both):
+      1) onset_sec  offset_sec  word
+      2) word  onset_sec  offset_sec
     """
     events: List[Dict[str, Any]] = []
-    if not labels_path.exists():
-        LOG_WARN("No labels file found; falling back to OTHER-only windows.")
-        return events
-
     with open(labels_path, "r", encoding="utf-8") as f:
-        line_idx = 0
         for line in f:
-            s = line.strip()
-            if not s or s.startswith("#"):
+            line = line.strip()
+            if not line or line.startswith("#"):
                 continue
-            parts = [p.strip() for p in s.replace(",", "\t").split("\t") if p.strip()]
+
+            parts = line.split()
             if len(parts) < 3:
                 continue
 
-            # A) start, end, label
-            if _is_float(parts[0]) and _is_float(parts[1]) and not _is_float(parts[2]):
-                start_sec = float(parts[0])
-                end_sec = float(parts[1])
-                label = _norm_label(parts[2])
-                onset_sec = 0.5 * (start_sec + end_sec)
-                events.append(
-                    {"trial_id": f"trial_{line_idx}", "label": label, "onset_sec": onset_sec}
-                )
-                line_idx += 1
-                continue
+            try:
+                onset = float(parts[0])
+                offset = float(parts[1])
+                word = parts[2]
+            except ValueError:
+                word = parts[0]
+                onset = float(parts[1])
+                offset = float(parts[2])
 
-            # B) trial_id, label, onset_sec
-            if (not _is_float(parts[0])) and _is_float(parts[2]):
-                trial_id = parts[0]
-                label = _norm_label(parts[1])
-                onset_sec = float(parts[2])
-                events.append({"trial_id": trial_id, "label": label, "onset_sec": onset_sec})
-                line_idx += 1
-                continue
+            events.append(
+                {
+                    "onset": onset,
+                    "offset": offset,
+                    "label": word,
+                }
+            )
 
-            # Fallback: if first two look numeric, treat as start/end
-            if _is_float(parts[0]) and _is_float(parts[1]):
-                start_sec = float(parts[0])
-                end_sec = float(parts[1])
-                label = _norm_label(parts[2])
-                onset_sec = 0.5 * (start_sec + end_sec)
-                events.append(
-                    {"trial_id": f"trial_{line_idx}", "label": label, "onset_sec": onset_sec}
-                )
-                line_idx += 1
-                continue
+    logger.info(f"[INFO] Loaded {len(events)} label events")
 
-            LOG_WARN(f"Skipped label line (unrecognized format): {s}")
+    # Log distribution *before* windowing, but *after* normalization
+    norm_counts: Dict[str, int] = {}
+    for ev in events:
+        norm = normalize_label(ev["label"])
+        norm_counts[norm] = norm_counts.get(norm, 0) + 1
 
-    LOG_INFO(f"Loaded {len(events)} label events")
+    logger.info("[INFO] Class counts in label events (after normalization, before windowing):")
+    for k in sorted(norm_counts.keys()):
+        logger.info(f"[INFO]   {k}: {norm_counts[k]}")
+
     return events
 
-# ---------------- Helpers: path resolution ----------------
-def _search_under_bases(rel: Path) -> Optional[Path]:
-    LOG_INFO("Resolving data paths (searching DATA_BASES_FOR_SEARCH):")
-    for base in DATA_BASES_FOR_SEARCH:
-        LOG_DEBUG(f"  Base: {base}")
-        cand = (base / rel)
-        ok = cand.exists()
-        LOG_DEBUG(f"    -> {_norm(cand)} [{'OK' if ok else 'missing'}]")
-        if ok:
-            return cand
-    return None
 
-def resolve_patient_paths(patient_id: str, patients_config_path: Path) -> Tuple[Path, Path, Optional[Path]]:
-    with open(patients_config_path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    patients = cfg.get("patients", {})
-    if patient_id not in patients:
-        raise KeyError(f"Patient '{patient_id}' not in patients_config.json")
-
-    pinfo = patients[patient_id]
-    labels_rel = Path(pinfo["labels_file"])
-    lfp_rel    = Path(pinfo["lfp_folder"])
-    offset_rel = Path(pinfo.get("offset_file", "")) if pinfo.get("offset_file") else None
-
-    labels = _search_under_bases(labels_rel)
-    lfp    = _search_under_bases(lfp_rel)
-    offset = _search_under_bases(offset_rel) if offset_rel else None
-
-    if labels is None:
-        raise FileNotFoundError(
-            "Labels file not found.\n"
-            f"  -> Expected relative: {labels_rel}\n"
-            "Fix 'labels_file' in patients_config.json."
-        )
-    if lfp is None or not lfp.is_dir():
-        raise FileNotFoundError(
-            "LFP folder not found.\n"
-            f"  -> Expected relative: {lfp_rel}\n"
-            "Fix 'lfp_folder' in patients_config.json."
-        )
-
-    LOG_DEBUG(f"Resolved labels: {_norm(labels)}")
-    LOG_DEBUG(f"Resolved LFP dir: {_norm(lfp)}")
-    if offset:
-        LOG_DEBUG(f"Resolved offset: {_norm(offset)}")
-    return lfp, labels, offset
-
-# ---------------- LFP readers / exporters ----------------
-def _clean_dir(dir_path: Path, pattern: str = "*.csv") -> None:
-    """Remove existing files (e.g., from previous runs) to avoid cross-patient mixing."""
-    if dir_path.exists():
-        for p in dir_path.glob(pattern):
-            try:
-                p.unlink()
-            except Exception:
-                pass
-    else:
-        dir_path.mkdir(parents=True, exist_ok=True)
-
-def export_lfp_csvs(lfp_folder: Path, out_dir: Path) -> None:
+# -----------------------------------------------------------------------------
+# Auto-detect offset
+# -----------------------------------------------------------------------------
+def auto_detect_offset_seconds(
+    label_events: List[Dict[str, Any]],
+    fs: float,
+    n_samples: int,
+    pre_sec: float,
+    post_sec: float,
+) -> float:
     """
-    Export v7.3 MAT channels to per-channel CSVs with columns: time, signal.
-    MAT structure:
-      - signal: '#refs#/g'
-      - sample rate (Hz): '#refs#/f/rowTimes/sampleRate'
+    Automatically detect a global offset_sec such that:
+        pre_sec <= onset_i + offset_sec <= duration - post_sec
+
+    For as many events as possible.
     """
-    _clean_dir(out_dir, "*.csv")
-    mat_files = sorted([p for p in lfp_folder.iterdir() if p.suffix.lower() == ".mat"])
-    for fname in mat_files:
-        with h5py.File(str(fname), 'r') as f:
-            if "#refs#/g" not in f:
-                raise RuntimeError(f"{fname.name}: '#refs#/g' not found (unexpected MAT structure)")
-            signal = np.array(f["#refs#/g"]).astype(np.float64).flatten()
-            sr_ds = f.get("#refs#/f/rowTimes/sampleRate")
-            if sr_ds is None:
-                raise RuntimeError(f"{fname.name}: sampleRate not found at '#refs#/f/rowTimes/sampleRate'")
-            sr = float(sr_ds[()])
-            times = np.arange(len(signal)) / sr
-            df = pd.DataFrame({"time": times, "signal": signal})
-            out_path = out_dir / fname.name.replace(".mat", ".csv")
-            df.to_csv(out_path, index=False)
-            dur = times[-1] if len(times) > 0 else 0.0
-            print(f"[EXPORT] {fname.name}: {len(signal)} samples @ {sr:.2f} Hz → {dur:.3f}s → {out_path}")
+    if not label_events:
+        logger.warning("[WARN] No label events provided, using offset_sec=0.0")
+        return 0.0
 
-def _load_all_channel_csvs(lfp_csv_dir: Path) -> Dict[str, pd.DataFrame]:
-    """
-    Load all CSVs in a directory and enforce a common length/time grid:
-      - Trim all to min length (Lmin)
-      - Use first channel's time as master, overwrite others if needed
-    """
-    csv_files = sorted([p for p in lfp_csv_dir.iterdir() if p.suffix.lower() == ".csv"])
-    if not csv_files:
-        raise RuntimeError(f"No CSV files found in {lfp_csv_dir}")
+    duration = n_samples / fs
+    lower_bounds = []
+    upper_bounds = []
 
-    ch2df: Dict[str, pd.DataFrame] = {}
-    lengths: List[int] = []
-    for p in csv_files:
-        df = pd.read_csv(p)
-        if "time" not in df.columns or "signal" not in df.columns:
-            raise ValueError(f"{p.name} must contain 'time' and 'signal' columns")
-        df = df[["time", "signal"]].copy()
-        ch2df[p.stem] = df
-        lengths.append(len(df))
+    for ev in label_events:
+        onset = float(ev["onset"])
+        lower_bounds.append(pre_sec - onset)
+        upper_bounds.append(duration - post_sec - onset)
 
-    Lmin = int(min(lengths))
-    if len(set(lengths)) > 1:
-        LOG_WARN(f"Channel CSVs have different lengths; trimming all to Lmin={Lmin} samples.")
+    low = max(lower_bounds)
+    high = min(upper_bounds)
 
-    first_ch = sorted(ch2df.keys())[0]
-    master_time = ch2df[first_ch]["time"].values[:Lmin]
-    tol = 1e-6
-
-    for ch, df in ch2df.items():
-        if len(df) != Lmin:
-            df = df.iloc[:Lmin].reset_index(drop=True)
+    if low <= high:
+        if low <= 0.0 <= high:
+            offset_sec = 0.0
         else:
-            df = df.reset_index(drop=True)
-        t = df["time"].values
-        if len(t) != Lmin or np.max(np.abs(t - master_time[:len(t)])) > tol:
-            df["time"] = master_time
-        ch2df[ch] = df
+            offset_sec = low if abs(low) < abs(high) else high
 
-    return ch2df
+        logger.info(
+            "[INFO] Auto-detected offset_sec=%.3f s from intersection [%.3f, %.3f]",
+            offset_sec,
+            low,
+            high,
+        )
+        return offset_sec
 
-# ---------------- Offset resolution ----------------
-def _resolve_offset_seconds(offset_file: Optional[Path]) -> float:
-    if not offset_file or not offset_file.exists():
-        raise FileNotFoundError("Offset file not found (provide 'offset_file' in patients_config.json).")
-    with h5py.File(str(offset_file), 'r') as f:
-        if "new_start_end_times_micsec" not in f:
-            raise RuntimeError("Offset MAT missing 'new_start_end_times_micsec'")
-        arr = np.array(f["new_start_end_times_micsec"])
-        start_micro = float(arr.flat[0])
-        return start_micro / 1e6
+    offset_sec = 0.5 * (low + high)
+    logger.warning(
+        "[WARN] No common offset satisfying all events. "
+        "Using offset_sec=%.3f (avg of [%.3f, %.3f]).",
+        offset_sec,
+        low,
+        high,
+    )
+    return offset_sec
 
-# ---------------- Window extraction ----------------
-def _slice_window_multich(ch2df: Dict[str, pd.DataFrame],
-                          t_center: float,
-                          win_samples: int,
-                          sr_float: float) -> Optional[np.ndarray]:
-    idx_center = int(round(t_center * sr_float))
-    start = idx_center - win_samples // 2
-    end = start + win_samples
-    L = len(next(iter(ch2df.values())))
-    if start < 0 or end > L:
-        return None
-    mats: List[np.ndarray] = []
-    # keep deterministic channel order
-    for ch in sorted(ch2df.keys()):
-        sig = ch2df[ch]["signal"].values
-        mats.append(sig[start:end][:, None])  # [T,1]
-    return np.concatenate(mats, axis=1)  # [T,C]
 
-# ---------------- Trial split ----------------
-def stratified_trials_split(events: List[Dict[str, Any]],
-                            per_class_test: int,
-                            per_class_val: int,
-                            seed: int) -> Tuple[List[str], List[str], List[str]]:
-    by_label: Dict[str, List[str]] = {"HAARYE": [], "TUT": [], "OTHER": []}
-    for ev in events:
-        lbl = ev["label"]
-        if lbl in by_label:
-            by_label[lbl].append(ev["trial_id"])
-    rng = np.random.default_rng(seed)
-    for k in by_label:
-        rng.shuffle(by_label[k])
-
-    test_ids, val_ids, train_ids = [], [], []
-    for _, ids in by_label.items():
-        t_take = min(per_class_test, len(ids))
-        v_take = min(per_class_val, max(0, len(ids) - t_take))
-        test_ids.extend(ids[:t_take])
-        start = t_take
-        end = t_take + v_take
-        val_ids.extend(ids[start:end])
-        train_ids.extend(ids[end:])
-    return train_ids, val_ids, test_ids
-
-# ---------------- Main core API ----------------
-def process_patient(patient_id: str,
-                    patients_config_path: str = str(PATIENTS_CONFIG_PATH),
-                    cfg: Optional[PreprocConfig] = None) -> Tuple[str, str]:
+# -----------------------------------------------------------------------------
+# Window building – speech events
+# -----------------------------------------------------------------------------
+def zscore_per_channel(signals: np.ndarray) -> np.ndarray:
     """
-    Returns (npy_path, splits_json_path)
+    Z-score per channel: signals is [n_channels, n_samples].
     """
-    if cfg is None:
-        cfg = PreprocConfig()
+    ch_mean = signals.mean(axis=1, keepdims=True)
+    ch_std = signals.std(axis=1, keepdims=True) + 1e-8
+    return (signals - ch_mean) / ch_std
 
-    LOG_INFO("Running preprocessing ...")
-    lfp_dir, labels_path, offset_path = resolve_patient_paths(patient_id, Path(patients_config_path))
 
-    # Per-patient CSV dir to avoid cross-patient mixing
-    csv_root = PROCESSED_DATA_DIR / cfg.csv_root_dirname
-    lfp_csv_dir = csv_root / patient_id
+def build_speech_windows(
+    signals: np.ndarray,
+    fs: float,
+    offset_sec: float,
+    label_events: List[Dict[str, Any]],
+    pre_sec: float,
+    post_sec: float,
+) -> List[Dict[str, Any]]:
+    """
+    Build windows around each labeled speech event (HAARYE, AHAV, TUT, etc).
+    AHAV is mapped to OTHER via normalize_label.
 
-    if cfg.do_export_csv:
-        LOG_INFO("SKIP_LFP_EXPORT setting is controlled inside preprocessing.py")
-        export_lfp_csvs(lfp_dir, lfp_csv_dir)
+    Returns a list of dicts:
+      - signals: [T, C] float32
+      - label: 'HAARYE' / 'TUT' / 'OTHER'
+      - raw_label: original string from file (e.g. 'AHAV')
+      - is_speech: True
+      - start_time / end_time: in seconds (LFP local time)
+    """
+    n_channels, n_samples = signals.shape
+    logger.info(f"[INFO] Signals shape: {n_channels} channels x {n_samples} samples")
+
+    pre_samples = int(round(pre_sec * fs))
+    post_samples = int(round(post_sec * fs))
+
+    windows: List[Dict[str, Any]] = []
+
+    for ev in label_events:
+        raw_label = ev["label"]
+        onset = float(ev["onset"])
+        normalized = normalize_label(raw_label)
+
+        center_time = onset + offset_sec
+        center_idx = int(round(center_time * fs))
+
+        start_idx = center_idx - pre_samples
+        end_idx = center_idx + post_samples
+
+        if start_idx < 0 or end_idx > n_samples:
+            continue
+
+        window_signals = signals[:, start_idx:end_idx].T.astype(np.float32)
+
+        win = {
+            "signals": window_signals,
+            "label": normalized,
+            "raw_label": raw_label,
+            "is_speech": True,
+            "start_time": float(start_idx / fs),
+            "end_time": float(end_idx / fs),
+        }
+        windows.append(win)
+
+    return windows
+
+
+# -----------------------------------------------------------------------------
+# Window building – background (unlabeled) OTHER
+# -----------------------------------------------------------------------------
+def build_background_windows(
+    signals: np.ndarray,
+    fs: float,
+    offset_sec: float,
+    label_events: List[Dict[str, Any]],
+    pre_sec: float,
+    post_sec: float,
+    base_other_count: int,
+    target_other_total: int,
+) -> List[Dict[str, Any]]:
+    """
+    Build OTHER windows from *unlabeled* segments (r̄eal background).
+
+    Idea:
+      - Take gaps between labeled speech segments (plus before first and after last)
+      - In every gap, place non-overlapping windows of length (pre_sec + post_sec)
+      - Label them as OTHER (raw_label='BACKGROUND', is_speech=False)
+      - Stop once OTHER total reaches target_other_total.
+    """
+    if target_other_total <= base_other_count:
+        return []
+
+    max_additional = target_other_total - base_other_count
+
+    n_channels, n_samples = signals.shape
+    duration = n_samples / fs
+    win_len = pre_sec + post_sec
+    margin = 0.1  # small safety margin in seconds
+    step_sec = win_len  # non-overlapping background windows
+
+    # Convert label events to local LFP times
+    events_local = []
+    for ev in label_events:
+        onset_local = float(ev["onset"]) + offset_sec
+        offset_local = float(ev["offset"]) + offset_sec
+        events_local.append((onset_local, offset_local))
+
+    if not events_local:
+        # no labels? take windows across entire recording
+        gap_intervals = [(0.0, duration)]
     else:
-        LOG_INFO("Skipping LFP->CSV export (do_export_csv=False)")
-        lfp_csv_dir.mkdir(parents=True, exist_ok=True)
+        events_local.sort(key=lambda x: x[0])
 
-    # Labels + optional offset shift
-    events = load_labels_file(labels_path)
-    if offset_path is not None and len(events) > 0:
-        try:
-            off_sec = _resolve_offset_seconds(offset_path)
-        except Exception as e:
-            LOG_WARN(f"Offset read failed ({e}); using 0.0")
-            off_sec = 0.0
-        new_events = []
-        for ev in events:
-            onset = float(ev["onset_sec"])
-            if onset < 1e6:  # heuristic: not an absolute epoch
-                onset = onset + off_sec
-            new_events.append({"trial_id": ev["trial_id"], "label": ev["label"], "onset_sec": onset})
-        events = new_events
+        gap_intervals: List[Tuple[float, float]] = []
 
-    # Build windows
-    ch2df = _load_all_channel_csvs(lfp_csv_dir)
-    sr = float(cfg.sample_rate)
-    win_samples = int(round(sr * (cfg.window_size_ms / 1000.0)))
-    L = len(next(iter(ch2df.values())))
+        # Before first event
+        first_onset = events_local[0][0]
+        if first_onset > 0.0 + margin:
+            gap_intervals.append((0.0, first_onset - margin))
 
-    items: List[Dict[str, Any]] = []
-    pos_mask = np.zeros(L, dtype=bool)
-    # positive windows + occupancy mask
-    for ev in events:
-        if ev["label"] not in {"HAARYE", "TUT"}:
-            continue
-        x = _slice_window_multich(ch2df, ev["onset_sec"], win_samples, sr)
-        if x is None:
-            continue
-        items.append({"signals": x.astype(np.float32), "label": ev["label"], "trial_id": ev["trial_id"]})
+        # Between events
+        for (on1, off1), (on2, off2) in zip(events_local[:-1], events_local[1:]):
+            gap_start = off1 + margin
+            gap_end = on2 - margin
+            if gap_end - gap_start >= win_len:
+                gap_intervals.append((gap_start, gap_end))
 
-        margin = int(round(sr * (cfg.other_margin_ms / 1000.0)))
-        idx_center = int(round(ev["onset_sec"] * sr))
-        i0 = max(0, idx_center - win_samples // 2 - margin)
-        i1 = min(L, idx_center + win_samples // 2 + margin)
-        if i1 > i0:
-            pos_mask[i0:i1] = True
+        # After last event
+        last_off = events_local[-1][1]
+        if duration - last_off > margin:
+            gap_intervals.append((last_off + margin, duration))
 
-    num_pos = sum(1 for it in items if it["label"] in {"HAARYE", "TUT"})
+    bg_windows: List[Dict[str, Any]] = []
 
-    # OTHER windows (limited by ratio), only if we have positives
-    if num_pos > 0 and cfg.other_ratio > 0:
-        free = ~pos_mask
-        edges = np.diff(np.concatenate(([0], free.astype(np.int8), [0])))
-        starts = np.where(edges == 1)[0]
-        ends   = np.where(edges == -1)[0]
+    for (gap_start, gap_end) in gap_intervals:
+        # start placing centers so that full window is inside gap
+        center = gap_start + pre_sec
+        while center + post_sec <= gap_end and len(bg_windows) < max_additional:
+            center_idx = int(round(center * fs))
+            start_idx = center_idx - int(round(pre_sec * fs))
+            end_idx = center_idx + int(round(post_sec * fs))
 
-        centers: List[int] = []
-        for s, e in zip(starts, ends):
-            run_len = e - s
-            if run_len < win_samples:
+            if start_idx < 0 or end_idx > n_samples:
+                center += step_sec
                 continue
-            c_start = s + win_samples // 2
-            c_end   = e - win_samples // 2
-            step    = int(round(sr * (cfg.other_stride_ms / 1000.0)))
-            for c in range(c_start, c_end + 1, max(step, 1)):
-                centers.append(c)
 
-        target_other = int(max(1, cfg.other_ratio * num_pos))
-        if len(centers) > target_other:
-            idx = np.linspace(0, len(centers) - 1, target_other).astype(int)
-            centers = [centers[i] for i in idx]
+            window_signals = signals[:, start_idx:end_idx].T.astype(np.float32)
 
-        for c in centers:
-            t_center = c / sr
-            x = _slice_window_multich(ch2df, t_center, win_samples, sr)
-            if x is None:
-                continue
-            items.append({"signals": x.astype(np.float32), "label": "OTHER", "trial_id": f"OTHER_{c}"})
+            win = {
+                "signals": window_signals,
+                "label": "OTHER",
+                "raw_label": "BACKGROUND",
+                "is_speech": False,
+                "start_time": float(start_idx / fs),
+                "end_time": float(end_idx / fs),
+            }
+            bg_windows.append(win)
 
-    # -------- Debug: class counts before splits --------
-    label_counts = Counter(it["label"] for it in items)
-    LOG_INFO("Class counts in preprocessing (before splits):")
-    for lbl in ["HAARYE", "OTHER", "TUT"]:
-        LOG_INFO(f"  {lbl}: {label_counts.get(lbl, 0)}")
-    LOG_INFO(f"Total windows: {len(items)}")
-    # ---------------------------------------------------
+            center += step_sec
 
-    # Trial-based splits
-    train_ids, val_ids, test_ids = stratified_trials_split(
-        [{"trial_id": it["trial_id"], "label": it["label"]} for it in items],
-        cfg.per_class_test, cfg.per_class_val, cfg.seed
+        if len(bg_windows) >= max_additional:
+            break
+
+    return bg_windows
+
+
+# -----------------------------------------------------------------------------
+# Split metadata saving
+# -----------------------------------------------------------------------------
+def save_splits_dummy(
+    windows: List[Dict[str, Any]],
+    out_splits_path: str,
+    n_folds: int = 5,
+) -> None:
+    """
+    Save simple split metadata for compatibility with main.py.
+    Actual CV folds are built inside train_classification.py.
+    """
+    labels = [w["label"] for w in windows]
+    counts = {c: labels.count(c) for c in set(labels)}
+
+    data = {
+        "meta": {
+            "num_samples": len(windows),
+            "class_counts": counts,
+        },
+        "folds": n_folds,
+    }
+
+    os.makedirs(os.path.dirname(out_splits_path), exist_ok=True)
+    with open(out_splits_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+    logger.info(f"[INFO] Saved splits → {out_splits_path}")
+
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Preprocess LFP data for classification.")
+    parser.add_argument("--patient_id", required=True, help="Patient ID, e.g., Patient_03")
+    parser.add_argument("--out_data", required=True, help="Path to .npy file to save windows")
+    parser.add_argument("--out_splits", required=True, help="Path to .json file to save splits")
+    parser.add_argument("--force", action="store_true", help="Force reprocessing even if exists")
+    parser.add_argument(
+        "--pre_sec",
+        type=float,
+        default=0.5,
+        help="Seconds before event onset for window.",
+    )
+    parser.add_argument(
+        "--post_sec",
+        type=float,
+        default=1.0,
+        help="Seconds after event onset for window.",
+    )
+    parser.add_argument(
+        "--n_folds",
+        type=int,
+        default=5,
+        help="Number of folds metadata for CV.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    out_data_path = Path(args.out_data)
+    out_splits_path = Path(args.out_splits)
+
+    if out_data_path.exists() and not args.force:
+        logger.info(f"[INFO] {out_data_path} already exists. Use --force to overwrite.")
+        return
+
+    logger.info("[INFO] Running preprocessing ...")
+
+    # Resolve paths
+    rel_labels, rel_lfp_dir, rel_offset = build_patient_rel_paths(args.patient_id)
+
+    labels_path = resolve_in_bases(rel_labels)
+    lfp_dir = resolve_in_bases(rel_lfp_dir)
+    _ = resolve_in_bases(rel_offset)  # not currently used, but path-checked
+
+    # Load signals
+    signals, fs, channel_names = load_lfp_signals_from_mat_dir(lfp_dir)
+    n_channels, n_samples = signals.shape
+
+    # Z-score per channel
+    signals = zscore_per_channel(signals)
+
+    # Load labels
+    label_events = load_label_events(labels_path)
+
+    # Auto-detect global offset
+    offset_sec = auto_detect_offset_seconds(
+        label_events=label_events,
+        fs=fs,
+        n_samples=n_samples,
+        pre_sec=args.pre_sec,
+        post_sec=args.post_sec,
     )
 
-    idx_train, idx_val, idx_test = [], [], []
-    for i, it in enumerate(items):
-        tid = it["trial_id"]
-        if tid in test_ids:
-            idx_test.append(i)
-        elif tid in val_ids:
-            idx_val.append(i)
-        else:
-            idx_train.append(i)
+    # Build speech windows (HAARYE / AHAV→OTHER / TUT)
+    speech_windows = build_speech_windows(
+        signals=signals,
+        fs=fs,
+        offset_sec=offset_sec,
+        label_events=label_events,
+        pre_sec=args.pre_sec,
+        post_sec=args.post_sec,
+    )
 
-    # Save outputs
-    PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    npy_path = PROCESSED_DATA_DIR / f"{patient_id}_classification_data.npy"
-    split_path = PROCESSED_DATA_DIR / f"{patient_id}_splits.json"
+    # Count current labels from speech events only
+    speech_counts: Dict[str, int] = {}
+    for w in speech_windows:
+        speech_counts[w["label"]] = speech_counts.get(w["label"], 0) + 1
 
-    np.save(npy_path, np.array(items, dtype=object), allow_pickle=True)
-    with open(split_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "patient_id": patient_id,
-            "train_idx": idx_train,
-            "val_idx": idx_val,
-            "test_idx": idx_test
-        }, f, ensure_ascii=False, indent=2)
+    logger.info("[INFO] Class counts from speech events (after windowing):")
+    for k in sorted(speech_counts.keys()):
+        logger.info(f"[INFO]   {k}: {speech_counts[k]}")
 
-    LOG_INFO(f"Saved {len(items)} windows → {npy_path}")
-    LOG_INFO(f"Saved splits → {split_path}")
-    return str(npy_path), str(split_path)
+    base_other = speech_counts.get("OTHER", 0)
+    max_main_class = max(
+        speech_counts.get("HAARYE", 0),
+        speech_counts.get("TUT", 0),
+    )
 
-# ---------------- CLI entry point (for main.py subprocess) ----------------
+    # We want OTHER to be (slightly) the largest class, but not crazy:
+    # e.g., ~20% more than the largest among HAARYE/TUT.
+    target_other_total = int(1.2 * max_main_class)
+
+    # Build background OTHER windows from unlabeled gaps
+    bg_windows = build_background_windows(
+        signals=signals,
+        fs=fs,
+        offset_sec=offset_sec,
+        label_events=label_events,
+        pre_sec=args.pre_sec,
+        post_sec=args.post_sec,
+        base_other_count=base_other,
+        target_other_total=target_other_total,
+    )
+
+    windows = speech_windows + bg_windows
+
+    # Final counts
+    final_counts: Dict[str, int] = {}
+    for w in windows:
+        final_counts[w["label"]] = final_counts.get(w["label"], 0) + 1
+
+    logger.info("[INFO] Class counts in preprocessing (before splits):")
+    for k in sorted(final_counts.keys()):
+        logger.info(f"[INFO]   {k}: {final_counts[k]}")
+    logger.info(f"[INFO] Total windows: {len(windows)}")
+
+    # Save .npy
+    out_data_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(out_data_path, np.array(windows, dtype=object))
+    logger.info(f"[INFO] Saved {len(windows)} windows → {out_data_path}")
+
+    # Save splits meta
+    save_splits_dummy(windows, str(out_splits_path), n_folds=args.n_folds)
+
+
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Preprocessing for LFP classification")
-    parser.add_argument("--patient_id", required=True, help="Patient ID, e.g. Patient_03")
-    parser.add_argument("--out_data", type=str, default=None,
-                        help="Output .npy path (main.py passes this, but by default we use PROCESSED_DATA_DIR)")
-    parser.add_argument("--out_splits", type=str, default=None,
-                        help="Output .json splits path (main.py passes this)")
-    parser.add_argument("--force", action="store_true", help="Currently unused; kept for compatibility")
-
-    args = parser.parse_args()
-
-    # Run core pipeline
-    npy_path, split_path = process_patient(args.patient_id)
-
-    # If main.py passed explicit paths and they differ, copy to them
-    if args.out_data is not None:
-        out_data_path = Path(args.out_data)
-        out_data_path.parent.mkdir(parents=True, exist_ok=True)
-        if Path(npy_path).resolve() != out_data_path.resolve():
-            shutil.copy2(npy_path, out_data_path)
-    if args.out_splits is not None:
-        out_splits_path = Path(args.out_splits)
-        out_splits_path.parent.mkdir(parents=True, exist_ok=True)
-        if Path(split_path).resolve() != out_splits_path.resolve():
-            shutil.copy2(split_path, out_splits_path)
+    main()

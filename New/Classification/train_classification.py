@@ -13,9 +13,10 @@ from torch.utils.data import Dataset, DataLoader
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# LSTMClassifier – defined here so we are not dependent on external imports
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# LSTMClassifier – internal definition (can be overridden by external model)
+# ===========================================================================
+
 
 class LSTMClassifier(nn.Module):
     def __init__(
@@ -46,7 +47,6 @@ class LSTMClassifier(nn.Module):
 
         self.num_directions = 2 if bidirectional else 1
 
-        # dropout here is for between-layers dropout in LSTM if num_layers > 1
         lstm_dropout = dropout if num_layers > 1 else 0.0
 
         self.lstm = nn.LSTM(
@@ -65,44 +65,42 @@ class LSTMClassifier(nn.Module):
         """
         x: (batch, seq_len, input_size)
         """
-        out, (h_n, c_n) = self.lstm(x)  # h_n: (num_layers * num_directions, batch, hidden_size)
+        out, (h_n, c_n) = self.lstm(x)
         if self.bidirectional:
-            # concatenate last layer forward & backward
-            h_last = torch.cat(
-                [h_n[-2], h_n[-1]], dim=-1
-            )  # (batch, hidden_size * 2)
+            h_last = torch.cat([h_n[-2], h_n[-1]], dim=-1)
         else:
-            h_last = h_n[-1]  # (batch, hidden_size)
+            h_last = h_n[-1]
 
         h_last = self.dropout(h_last)
         logits = self.fc(h_last)
         return logits
 
 
-# ---------------------------------------------------------------------------
-# OPTIONAL: if you have an external model module, we can override the class.
-# This will NOT crash if imports fail.
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# OPTIONAL OVERRIDE: if you have Classification/model.py or model.py
+# ===========================================================================
 
 try:
-    # If you created Classification/model/__init__.py with LSTMClassifier in it
     from Classification.model import LSTMClassifier as ExternalLSTMClassifier
+
     LSTMClassifier = ExternalLSTMClassifier
     logger.info("INFO: Using LSTMClassifier from Classification.model")
 except Exception:
     try:
-        # Or if you have a flat model.py in the same folder
         from model import LSTMClassifier as ExternalLSTMClassifier
+
         LSTMClassifier = ExternalLSTMClassifier
         logger.info("INFO: Using LSTMClassifier from model.py")
     except Exception:
-        # Fall back to the internal definition above
-        logger.info("INFO: Using internal LSTMClassifier definition in train_classification.py")
+        logger.info(
+            "INFO: Using internal LSTMClassifier definition in train_classification.py"
+        )
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Utility functions
-# ---------------------------------------------------------------------------
+# ===========================================================================
+
 
 def set_seed(seed: int = 42) -> None:
     random.seed(seed)
@@ -111,25 +109,31 @@ def set_seed(seed: int = 42) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def log_confusion_matrix(confusion: np.ndarray,
-                         idx_to_label: Dict[int, str],
-                         prefix: str = "") -> None:
+def log_confusion_matrix(
+    confusion: np.ndarray,
+    idx_to_label: Dict[int, str],
+    prefix: str = "",
+) -> None:
     """
     Log confusion matrix in a nice table format:
     rows=true labels, cols=predicted labels
     """
     n_classes = confusion.shape[0]
-    header = "            " + "   ".join([f"{idx_to_label[j]:>7}" for j in range(n_classes)])
+    header = "             " + "   ".join(
+        [f"{idx_to_label[j]:>7}" for j in range(n_classes)]
+    )
     logger.info("%sConfusion Matrix [rows=true, cols=pred]:", prefix)
     logger.info("%s%s", prefix, header)
     for i in range(n_classes):
         row_label = f"{idx_to_label[i]:>7}"
-        row_values = "  ".join([f"{confusion[i, j]:>6}" for j in range(n_classes)])
+        row_values = "  ".join([f"{confusion[i, j]:>7}" for j in range(n_classes)])
         logger.info("%s%8s  %s", prefix, row_label, row_values)
 
 
-def compute_per_class_metrics(confusion: np.ndarray,
-                              idx_to_label: Dict[int, str]) -> Tuple[Dict[int, Dict[str, float]], float]:
+def compute_per_class_metrics(
+    confusion: np.ndarray,
+    idx_to_label: Dict[int, str],
+) -> Tuple[Dict[int, Dict[str, float]], float]:
     """
     Compute precision/recall/F1 per class and macro-F1.
     """
@@ -150,7 +154,7 @@ def compute_per_class_metrics(confusion: np.ndarray,
             "precision": prec,
             "recall": rec,
             "f1": f1,
-            "support": float(confusion[i, :].sum())
+            "support": float(confusion[i, :].sum()),
         }
         f1_list.append(f1)
 
@@ -158,9 +162,10 @@ def compute_per_class_metrics(confusion: np.ndarray,
     return metrics, macro_f1
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Dataset
-# ---------------------------------------------------------------------------
+# ===========================================================================
+
 
 class ClassificationDataset(Dataset):
     def __init__(self, features: np.ndarray, labels: np.ndarray):
@@ -170,7 +175,9 @@ class ClassificationDataset(Dataset):
         """
         assert features.ndim == 3, "features must be (N, seq_len, feat_dim)"
         assert labels.ndim == 1, "labels must be (N,)"
-        assert features.shape[0] == labels.shape[0], "features and labels must have same length"
+        assert (
+            features.shape[0] == labels.shape[0]
+        ), "features and labels must have same length"
 
         self.features = features.astype(np.float32)
         self.labels = labels.astype(np.int64)
@@ -179,19 +186,19 @@ class ClassificationDataset(Dataset):
         return self.features.shape[0]
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = self.features[idx]   # (seq_len, feat_dim)
+        x = self.features[idx]
         y = self.labels[idx]
         return torch.from_numpy(x), torch.tensor(y)
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Data loading and preprocessing
-# ---------------------------------------------------------------------------
+# ===========================================================================
+
 
 def _infer_label_field(sample: Dict[str, Any]) -> str:
     """
     Try to infer the text label from a sample dict.
-    We support a few possible keys.
     """
     if "label" in sample:
         return str(sample["label"])
@@ -199,7 +206,6 @@ def _infer_label_field(sample: Dict[str, Any]) -> str:
         return str(sample["word"])
     if "class" in sample:
         return str(sample["class"])
-    # Fallback
     return "OTHER"
 
 
@@ -211,15 +217,6 @@ def load_classification_data(
     """
     Load classification data from the .npy produced in preprocessing.
 
-    Assumptions:
-    - The .npy contains an array/list of dicts.
-    - Each dict has:
-        - 'signals': np.ndarray (time, channels) or (channels, time)
-        - 'is_speech': bool (if False, mapped to OTHER)
-        - 'label' / 'word' / 'class' with one of the words: HAARYE, TUT, etc.
-    - We do temporal average pooling with pool_size to reduce sequence length.
-    - Then we apply per-channel global Z-score normalization (after pooling).
-
     Returns:
         X:  (N, seq_len, feat_dim)
         y:  (N,)
@@ -230,7 +227,6 @@ def load_classification_data(
     raw = np.load(data_path, allow_pickle=True)
     logger.info("INFO: [LOAD] Total windows in file: %d", len(raw))
 
-    # First pass: collect labels and raw signals
     signals_list: List[np.ndarray] = []
     labels_str: List[str] = []
 
@@ -253,34 +249,31 @@ def load_classification_data(
 
         sig = np.asarray(sig, dtype=np.float32)
 
-        # Ensure shape: (time, channels)
         if sig.ndim != 2:
             raise ValueError("signals must be 2D (time, channels) or (channels, time).")
 
-        # Heuristic: if one dimension is 48 (channels) use that as channels
+        # Ensure shape: (time, channels)
         if sig.shape[0] == 48 and sig.shape[1] != 48:
-            sig = sig.T  # now (time, channels)
+            sig = sig.T
         elif sig.shape[1] == 48:
-            # Already (time, channels)
             pass
         else:
-            # Fallback: assume second dimension is channels
             if sig.shape[1] < sig.shape[0]:
-                # (time, channels)
                 pass
             else:
-                # (channels, time)
                 sig = sig.T
 
         signals_list.append(sig)
         labels_str.append(label_str)
 
-    logger.info("INFO: [LOAD] Background windows (is_speech=False, all mapped to OTHER): %d", background_count)
+    logger.info(
+        "INFO: [LOAD] Background windows (is_speech=False, all mapped to OTHER): %d",
+        background_count,
+    )
 
     # Build label mapping
     unique_labels = sorted(list(set(labels_str)))
     if class_map is None:
-        # Force HAARYE / OTHER / TUT order if present
         preferred_order = ["HAARYE", "OTHER", "TUT"]
         label_to_idx: Dict[str, int] = {}
         idx = 0
@@ -297,7 +290,7 @@ def load_classification_data(
 
     idx_to_label = {v: k for k, v in label_to_idx.items()}
 
-    # Temporal pooling + stacking
+    # Temporal pooling
     pooled_list: List[np.ndarray] = []
     logger_once = getattr(load_classification_data, "_logger_once", False)
 
@@ -306,48 +299,58 @@ def load_classification_data(
         if not logger_once:
             flat_dim = t * c
             logger.info(
-                "INFO: Feature shape per sample BEFORE temporal pooling: seq_len=%d, feat_dim=%d, flat_dim=%d",
-                t, c, flat_dim
+                "INFO: Feature shape per sample BEFORE temporal pooling: "
+                "seq_len=%d, feat_dim=%d, flat_dim=%d",
+                t,
+                c,
+                flat_dim,
             )
-            load_classification_data._logger_once = True  # type: ignore
+            load_classification_data._logger_once = True  # type: ignore[attr-defined]
             logger_once = True
 
-        # trim to multiple of pool_size
         t_trim = (t // pool_size) * pool_size
         if t_trim == 0:
-            raise ValueError(f"Sequence too short for pool_size {pool_size}: length={t}")
+            raise ValueError(
+                f"Sequence too short for pool_size {pool_size}: length={t}"
+            )
 
-        sig_trim = sig[:t_trim]  # (t_trim, c)
+        sig_trim = sig[:t_trim]
         new_len = t_trim // pool_size
         sig_reshaped = sig_trim.reshape(new_len, pool_size, c)
-        pooled = sig_reshaped.mean(axis=1)  # (new_len, c)
+        pooled = sig_reshaped.mean(axis=1)
         pooled_list.append(pooled)
 
-    X = np.stack(pooled_list, axis=0)  # (N, seq_len, feat_dim)
+    X = np.stack(pooled_list, axis=0)
     seq_len, feat_dim = X.shape[1], X.shape[2]
     flat_dim_after = seq_len * feat_dim
     logger.info(
         "INFO: After temporal pooling: seq_len=%d, feat_dim_per_step=%d, flat_dim=%d (pool_size=%d)",
-        seq_len, feat_dim, flat_dim_after, pool_size
+        seq_len,
+        feat_dim,
+        flat_dim_after,
+        pool_size,
     )
     logger.info(
         "INFO: Effective input size to LSTM per sample: seq_len=%d, feat_dim=%d, flat_dim=%d",
-        seq_len, feat_dim, flat_dim_after
+        seq_len,
+        feat_dim,
+        flat_dim_after,
     )
 
     # Map labels to integers
     y = np.array([label_to_idx[s] for s in labels_str], dtype=np.int64)
 
     # Global Z-score per channel
-    X_2d = X.reshape(-1, feat_dim)  # (N*seq_len, feat_dim)
+    X_2d = X.reshape(-1, feat_dim)
     mean = X_2d.mean(axis=0, keepdims=True)
     std = X_2d.std(axis=0, keepdims=True) + 1e-6
     X_norm = (X_2d - mean) / std
     X_norm = X_norm.reshape(X.shape)
 
-    logger.info("INFO: Applied global per-channel Z-score normalization after temporal pooling.")
+    logger.info(
+        "INFO: Applied global per-channel Z-score normalization after temporal pooling."
+    )
 
-    # Log class counts
     logger.info("INFO: [LOAD] Final class counts after normalization:")
     total_samples = X_norm.shape[0]
     for idx, name in idx_to_label.items():
@@ -363,9 +366,25 @@ def load_classification_data(
     return X_norm, y, idx_to_label, label_to_idx
 
 
-# ---------------------------------------------------------------------------
-# Cyclic stratified CV splitter
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Data augmentation
+# ===========================================================================
+
+
+def augment_signals_gaussian(x: np.ndarray, noise_std: float = 0.05) -> np.ndarray:
+    """
+    Add small Gaussian noise to signals.
+    x: (N, seq_len, feat_dim)
+    """
+    noise = np.random.normal(0.0, noise_std, size=x.shape).astype(np.float32)
+    return x + noise
+
+
+# ===========================================================================
+# Cyclic stratified CV splitter (VAL → TEST → TRAIN rotation)
+# ===========================================================================
+
+
 def build_cyclic_stratified_folds(
     y: np.ndarray,
     label_to_idx: Dict[str, int],
@@ -376,7 +395,25 @@ def build_cyclic_stratified_folds(
 ) -> List[Dict[str, np.ndarray]]:
     """
     Build cyclic stratified folds with per-class control on VAL/TEST samples.
+
+    For each class c:
+      - We compute the maximum number of folds we can create
+        without reusing VAL samples of that class.
+      - If the requested cv_folds exceeds the global maximum possible
+        (across all classes), we raise an error with an explanation.
+      - Within the allowed number of folds, chunks for VAL/TEST are disjoint,
+        so no sample is used twice in VAL or twice in TEST.
     """
+    if val_per_class <= 0:
+        raise ValueError("val_per_class must be > 0.")
+    if test_per_class < 0:
+        raise ValueError("test_per_class must be >= 0.")
+    if test_per_class > val_per_class:
+        raise ValueError(
+            f"test_per_class={test_per_class} cannot be greater than val_per_class={val_per_class} "
+            "because VAL/TEST are drawn from the same per-class chunks."
+        )
+
     rng = np.random.RandomState(seed)
     n_classes = len(label_to_idx)
     all_indices = np.arange(len(y))
@@ -384,21 +421,24 @@ def build_cyclic_stratified_folds(
     class_indices: Dict[int, np.ndarray] = {}
     max_folds_per_class: Dict[int, int] = {}
 
-    logger.info("INFO: Cyclic CV: VAL per class per fold = %d, TEST per class per fold = %d", val_per_class, test_per_class)
+    logger.info(
+        "INFO: Cyclic CV: VAL per class per fold = %d, TEST per class per fold = %d",
+        val_per_class,
+        test_per_class,
+    )
 
-    # --- שלב 1: חישוב כמות ה-folds המקסימלית לכל מחלקה ---
+    # 1) Per-class max folds (no reuse of VAL samples)
     for label_str, label_idx in label_to_idx.items():
         idxs = np.where(y == label_idx)[0]
         rng.shuffle(idxs)
         class_indices[label_idx] = idxs
 
-        if val_per_class <= 0:
-            raise ValueError("val_per_class must be > 0.")
-        # כמה folds אפשר לקבל אם בכל fold יש val_per_class דוגמאות מהמחלקה הזו
         max_folds = len(idxs) // val_per_class
         max_folds_per_class[label_idx] = max_folds
 
-    logger.info("INFO: Max possible folds per class (cyclic VAL/TEST, no reuse of VAL/TEST samples):")
+    logger.info(
+        "INFO: Max possible folds per class (cyclic VAL/TEST, no reuse of VAL/TEST samples):"
+    )
     for label_idx, idxs in class_indices.items():
         max_folds = max_folds_per_class[label_idx]
         logger.info(
@@ -408,20 +448,40 @@ def build_cyclic_stratified_folds(
             len(idxs),
         )
 
-    # מספר ה-folds הגלובלי הוא המינימום על פני כל המחלקות
-    max_possible_folds = min([v for v in max_folds_per_class.values() if v > 0])
-    F = min(cv_folds, max_possible_folds)
-    logger.info("INFO: Maximum possible CV folds (global, all classes): %d", max_possible_folds)
+    positive_folds = [v for v in max_folds_per_class.values() if v > 0]
+    if not positive_folds:
+        raise ValueError("No class has enough samples for even 1 fold.")
+
+    max_possible_folds = min(positive_folds)
+
+    logger.info(
+        "INFO: Maximum possible CV folds (global, all classes): %d", max_possible_folds
+    )
+
+    # אם ביקשנו יותר מהאפשרי – נעצור עם שגיאה ברורה ולא נחתוך בשקט
+    if cv_folds > max_possible_folds:
+        logger.error(
+            "ERROR: Requested cv_folds=%d but maximum possible without reusing "
+            "VAL/TEST samples is %d. Reduce cv_folds or val_per_class.",
+            cv_folds,
+            max_possible_folds,
+        )
+        raise ValueError(
+            f"Requested cv_folds={cv_folds} but maximum possible without reuse is "
+            f"{max_possible_folds}. Reduce cv_folds or val_per_class."
+        )
+
+    F = cv_folds
     logger.info("INFO: Creating cyclic folds ...")
 
     folds: List[Dict[str, np.ndarray]] = []
 
-    # --- שלב 2: בניית ה-folds עצמם ---
+    # 2) Build folds
     for f in range(F):
         val_inds: List[int] = []
         test_inds: List[int] = []
 
-        # נעבור על המחלקות לפי האינדקס שלהן
+        # iterate classes in index order
         for _, label_idx in sorted(label_to_idx.items(), key=lambda x: x[1]):
             idxs = class_indices[label_idx]
             max_folds_c = max_folds_per_class[label_idx]
@@ -429,24 +489,24 @@ def build_cyclic_stratified_folds(
                 continue
 
             chunk_size = val_per_class
-            needed = max_folds_c * chunk_size  # מספר הדוגמאות שנשתמש בהן למחלקה הזו
-            # משתמשים רק ב- needed הראשונות כדי שיהיה ניתן לחלק שווה בשווה
+            needed = max_folds_c * chunk_size
             idxs_use = idxs[:needed]
 
-            # כאן מובטח ש־len(idxs_use) % max_folds_c == 0
+            # split idxs_use into max_folds_c equal chunks
             chunks = np.split(idxs_use, max_folds_c)
 
+            # VAL for this fold from chunk f
             if len(chunks[f]) < val_per_class:
-                # אין מספיק דוגמאות למחלקה הזו ב-fold הזה
                 continue
-
             val_c = chunks[f][:val_per_class]
-            # ל-test נשתמש ב-chunk הבא באופן מחזורי
+
+            # TEST for this fold from next chunk cyclically
             test_chunk = chunks[(f + 1) % max_folds_c]
-            test_c = test_chunk[:test_per_class]
+            test_c = test_chunk[:test_per_class] if test_per_class > 0 else []
 
             val_inds.extend(val_c.tolist())
-            test_inds.extend(test_c.tolist())
+            if test_per_class > 0:
+                test_inds.extend(test_c.tolist())
 
         val_inds = np.array(sorted(val_inds), dtype=np.int64)
         test_inds = np.array(sorted(test_inds), dtype=np.int64)
@@ -472,12 +532,16 @@ def build_cyclic_stratified_folds(
             len(test_inds),
         )
 
-    logger.info("INFO: ===== Cyclic stratified CV (folds; VAL->TEST rotation; no reuse of VAL/TEST samples) =====")
+    logger.info(
+        "INFO: ===== Cyclic stratified CV (folds; VAL->TEST rotation; no reuse of VAL/TEST samples) ====="
+    )
     return folds
 
-# ---------------------------------------------------------------------------
+
+# ===========================================================================
 # Training loop for a single fold
-# ---------------------------------------------------------------------------
+# ===========================================================================
+
 
 def train_one_fold(
     fold_idx: int,
@@ -498,6 +562,7 @@ def train_one_fold(
     early_stopping_patience: int,
     early_stopping_metric: str,
     other_class_weight: float,
+    augment_minor: bool,
 ) -> Dict[str, Any]:
     """
     Train one CV fold and return metrics & best model state.
@@ -509,23 +574,33 @@ def train_one_fold(
     n_classes = len(idx_to_label)
     logger.info(
         "INFO: [Fold %d] Sizes: TRAIN=%d, VAL=%d, TEST=%d",
-        fold_idx + 1, len(train_idx), len(val_idx), len(test_idx)
+        fold_idx + 1,
+        len(train_idx),
+        len(val_idx),
+        len(test_idx),
     )
 
     def log_counts(indices: np.ndarray, name: str) -> None:
-        logger.info("INFO: [Fold %d] %s (raw, before training) per-class counts:", fold_idx + 1, name)
+        logger.info(
+            "INFO: [Fold %d] %s (raw, before training) per-class counts:",
+            fold_idx + 1,
+            name,
+        )
         for c in range(n_classes):
             count_c = int((y[indices] == c).sum())
             logger.info("INFO:   %s: %d", idx_to_label[c], count_c)
 
     log_counts(val_idx, "VAL")
     log_counts(test_idx, "TEST")
-    logger.info("INFO: [Fold %d] TRAIN (raw, before balance/augmentation) per-class counts:", fold_idx + 1)
+    logger.info(
+        "INFO: [Fold %d] TRAIN (raw, before balance/augmentation) per-class counts:",
+        fold_idx + 1,
+    )
     for c in range(n_classes):
         count_c = int((y[train_idx] == c).sum())
         logger.info("INFO:   %s: %d", idx_to_label[c], count_c)
 
-    # Balance TRAIN by downsampling to smallest class
+    # Balance TRAIN by DOWNsampling to smallest class (after removing VAL/TEST)
     train_labels = y[train_idx]
     per_class_indices: Dict[int, np.ndarray] = {}
     for c in range(n_classes):
@@ -560,21 +635,38 @@ def train_one_fold(
         count_c = int((y[val_idx] == c).sum())
         logger.info("INFO:   %s: %d", idx_to_label[c], count_c)
 
-    logger.info("INFO: Augmentation DISABLED for this fold.")
-
-    X_train = X[balanced_train_indices]
-    y_train = y[balanced_train_indices]
+    # Extract data
+    X_train = X[balanced_train_indices].copy()
+    y_train = y[balanced_train_indices].copy()
     X_val = X[val_idx]
     y_val = y[val_idx]
     X_test = X[test_idx]
     y_test = y[test_idx]
+
+    # Data augmentation (optional) – keep class balance
+    if augment_minor:
+        logger.info(
+            "INFO: [Fold %d] Data augmentation ENABLED (Gaussian noise on non-OTHER classes).",
+            fold_idx + 1,
+        )
+        for c_idx, name in idx_to_label.items():
+            if name.upper() == "OTHER":
+                continue
+            mask_c = y_train == c_idx
+            if mask_c.sum() > 0:
+                X_train[mask_c] = augment_signals_gaussian(X_train[mask_c])
+    else:
+        logger.info("INFO: [Fold %d] Augmentation DISABLED for this fold.", fold_idx + 1)
 
     seq_len = X.shape[1]
     feat_dim = X.shape[2]
 
     logger.info(
         "INFO: [Fold %d] Using feature dimension per step: %d, sequence length: %d, batch_size=%d",
-        fold_idx + 1, feat_dim, seq_len, batch_size
+        fold_idx + 1,
+        feat_dim,
+        seq_len,
+        batch_size,
     )
 
     # Dataset and loaders
@@ -582,26 +674,34 @@ def train_one_fold(
     val_dataset = ClassificationDataset(X_val, y_val)
     test_dataset = ClassificationDataset(X_test, y_test)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=False)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, drop_last=False
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False, drop_last=False
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=batch_size, shuffle=False, drop_last=False
+    )
 
     # Model
     num_classes = len(idx_to_label)
+    # חשוב: קריאה במיקום בלבד כדי להתאים גם ל-model.py שלך
     model = LSTMClassifier(
-        input_size=feat_dim,
-        hidden_size=hidden_size,
-        num_layers=num_layers,
-        num_classes=num_classes,
-        bidirectional=bidirectional,
-        dropout=dropout,
+        feat_dim,
+        hidden_size,
+        num_layers,
+        num_classes,
+        bidirectional,
+        dropout,
     ).to(device)
 
-    logger.info("INFO: [Fold %d] Using weighted CrossEntropyLoss (special treatment for OTHER).", fold_idx + 1)
+    logger.info(
+        "INFO: [Fold %d] Using weighted CrossEntropyLoss (special treatment for OTHER).",
+        fold_idx + 1,
+    )
 
-    # Special treatment for OTHER class via loss weight:
-    # down-weight OTHER to focus more on speech classes (HAARYE, TUT).
-    # If OTHER is not present in mapping, use uniform weights.
+    # Special treatment for OTHER class via loss weight
     weights = np.ones(num_classes, dtype=np.float32)
     has_other = False
     for idx, name in idx_to_label.items():
@@ -610,12 +710,16 @@ def train_one_fold(
             has_other = True
     class_weights = torch.tensor(weights, dtype=torch.float32, device=device)
     if has_other:
-        logger.info("INFO: OTHER class found, using weight=%.3f in loss.", other_class_weight)
+        logger.info(
+            "INFO: OTHER class found, using weight=%.3f in loss.", other_class_weight
+        )
     else:
         logger.info("INFO: OTHER class not found, using uniform weights in loss.")
 
     criterion = nn.CrossEntropyLoss(weight=class_weights)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+    )
 
     def run_epoch(loader: DataLoader, train_mode: bool) -> Tuple[float, float, float]:
         if train_mode:
@@ -637,7 +741,7 @@ def train_one_fold(
                 if train_mode:
                     optimizer.zero_grad()
 
-                logits = model(batch_x)  # (batch, num_classes)
+                logits = model(batch_x)
                 loss = criterion(logits, batch_y)
 
                 if train_mode:
@@ -656,7 +760,6 @@ def train_one_fold(
         avg_loss = total_loss / max(total_samples, 1)
         acc = total_correct / max(total_samples, 1)
 
-        # compute macro-F1
         confusion = np.zeros((num_classes, num_classes), dtype=int)
         for t, p in zip(all_targets, all_preds):
             confusion[t, p] += 1
@@ -668,7 +771,7 @@ def train_one_fold(
     if early_stopping_metric.lower() == "macro_f1":
         best_metric = -math.inf  # maximize
     else:
-        best_metric = math.inf   # minimize (loss)
+        best_metric = math.inf  # minimize (loss)
 
     best_val_loss = math.inf
     best_val_macro_f1 = 0.0
@@ -692,12 +795,10 @@ def train_one_fold(
             val_macro_f1 * 100.0,
         )
 
-        # Choose metric for early stopping
         if early_stopping_metric.lower() == "macro_f1":
             current_metric = val_macro_f1
             improved = current_metric > best_metric + 1e-6
         else:
-            # use validation loss (lower is better)
             current_metric = val_loss
             improved = current_metric < best_metric - 1e-6
 
@@ -755,7 +856,9 @@ def train_one_fold(
     for t, p in zip(all_targets, all_preds):
         confusion[t, p] += 1
 
-    per_class_metrics, test_macro_f1 = compute_per_class_metrics(confusion, idx_to_label)
+    per_class_metrics, test_macro_f1 = compute_per_class_metrics(
+        confusion, idx_to_label
+    )
 
     logger.info("INFO: Fold %d — Test Accuracy: %.2f%%", fold_idx + 1, test_acc * 100.0)
     log_confusion_matrix(confusion, idx_to_label)
@@ -794,9 +897,10 @@ def train_one_fold(
     return result
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Public API: train_cross_validation
-# ---------------------------------------------------------------------------
+# ===========================================================================
+
 
 def train_cross_validation(
     data_path: str,
@@ -816,6 +920,7 @@ def train_cross_validation(
     early_stopping_patience: int = 20,
     early_stopping_metric: str = "macro_f1",
     other_class_weight: float = 0.5,
+    augment_minor: bool = False,
     seed: int = 42,
     device: Optional[str] = None,
     log_dir: Optional[str] = None,
@@ -824,16 +929,26 @@ def train_cross_validation(
     """
     Main entry point used by main.py.
 
-    - Adds dropout and L2 (weight_decay).
-    - Uses macro-F1 as early stopping metric by default.
-    - use_early_stopping flag controls automatic early stopping:
-        * True  -> standard early stopping with patience
-        * False -> no automatic stopping; run full num_epochs (manual style)
-    - other_class_weight controls CrossEntropyLoss weight for class OTHER.
+    - LSTM-based classifier.
+    - Cyclic CV: samples move VAL -> TEST -> TRAIN without reuse of VAL/TEST.
+    - TRAIN is balanced by downsampling to the smallest class (after removing VAL/TEST).
+    - Optional data augmentation (Gaussian noise) with augment_minor.
+    - Macro-F1 is used as early stopping metric by default.
+    - OTHER class handled via loss weight.
     """
-    del log_dir  # not used here, but accepted for compatibility
+    # תמיכה לאחור: אם main עדיין מעביר num_folds – נשתמש בו כ-cv_folds
+    if "num_folds" in kwargs:
+        old = kwargs.pop("num_folds")
+        logger.info("INFO: Received num_folds=%s in kwargs, overriding cv_folds=%d", old, cv_folds)
+        cv_folds = int(old)
+
+    # ignore any remaining extra args
     for k in kwargs.keys():
-        logger.info("INFO: Ignoring extra argument passed to train_cross_validation: %s", k)
+        logger.info(
+            "INFO: Ignoring extra argument passed to train_cross_validation: %s", k
+        )
+
+    del log_dir  # currently not used, kept for API compatibility
 
     set_seed(seed)
 
@@ -842,11 +957,12 @@ def train_cross_validation(
     else:
         device_t = torch.device(device)
     logger.info("INFO: Using device: %s", device_t)
+    logger.info("INFO: Requested cv_folds=%d", cv_folds)
 
     # Load data
     X, y, idx_to_label, label_to_idx = load_classification_data(data_path)
 
-    # Simple majority-class baseline
+    # Baseline: majority class
     unique, counts = np.unique(y, return_counts=True)
     majority_idx = int(unique[np.argmax(counts)])
     majority_name = idx_to_label[majority_idx]
@@ -863,7 +979,7 @@ def train_cross_validation(
     )
     logger.info("INFO: ===== END OF LABEL / INFORMATION QUALITY CHECK =====")
 
-    # Build folds
+    # Build folds (with error if cv_folds too large)
     folds = build_cyclic_stratified_folds(
         y=y,
         label_to_idx=label_to_idx,
@@ -873,10 +989,7 @@ def train_cross_validation(
         seed=seed,
     )
 
-    logger.info(
-        "INFO: Running cross-validation for patient_id=%s",
-        patient_id,
-    )
+    logger.info("INFO: Running cross-validation for patient_id=%s", patient_id)
 
     all_results: List[Dict[str, Any]] = []
     n_classes = len(idx_to_label)
@@ -902,6 +1015,7 @@ def train_cross_validation(
             early_stopping_patience=early_stopping_patience,
             early_stopping_metric=early_stopping_metric,
             other_class_weight=other_class_weight,
+            augment_minor=augment_minor,
         )
         all_results.append(result)
         overall_confusion += result["test_confusion"].astype(int)
@@ -933,12 +1047,20 @@ def train_cross_validation(
 
     test_accs = [r["test_acc"] for r in all_results]
     mean_test_acc = float(np.mean(test_accs)) if len(test_accs) > 0 else 0.0
-    logger.info("INFO: Mean test accuracy over %d folds: %.2f%%", len(all_results), mean_test_acc * 100.0)
+    logger.info(
+        "INFO: Mean test accuracy over %d folds: %.2f%%",
+        len(all_results),
+        mean_test_acc * 100.0,
+    )
 
-    logger.info("INFO: ========= OVERALL TEST CONFUSION MATRIX (all folds combined) =========")
+    logger.info(
+        "INFO: ========= OVERALL TEST CONFUSION MATRIX (all folds combined) ========="
+    )
     log_confusion_matrix(overall_confusion, idx_to_label)
 
-    overall_metrics, overall_macro_f1 = compute_per_class_metrics(overall_confusion, idx_to_label)
+    overall_metrics, overall_macro_f1 = compute_per_class_metrics(
+        overall_confusion, idx_to_label
+    )
     logger.info("INFO: Overall per-class metrics:")
     for c in range(n_classes):
         m = overall_metrics[c]
@@ -950,7 +1072,32 @@ def train_cross_validation(
             m["f1"] * 100.0,
             int(m["support"]),
         )
-    logger.info("INFO: Overall macro-F1 (all folds combined): %.2f%%", overall_macro_f1 * 100.0)
+    logger.info(
+        "INFO: Overall macro-F1 (all folds combined): %.2f%%",
+        overall_macro_f1 * 100.0,
+    )
+
+    # ========= T-TEST (מול baseline accuracy) =========
+    if len(test_accs) > 1:
+        try:
+            from scipy.stats import ttest_1samp
+
+            t_stat, p_val = ttest_1samp(test_accs, popmean=majority_acc)
+            logger.info(
+                "INFO: T-TEST vs baseline accuracy (%.2f%%): t=%.4f, p=%.4g",
+                majority_acc * 100.0,
+                t_stat,
+                p_val,
+            )
+        except Exception as e:
+            logger.info(
+                "INFO: Could not compute T-TEST (scipy missing or error: %s).", str(e)
+            )
+    else:
+        logger.info(
+            "INFO: Not enough folds (%d) to compute a meaningful T-TEST.",
+            len(test_accs),
+        )
 
 
 if __name__ == "__main__":
@@ -975,6 +1122,7 @@ if __name__ == "__main__":
     parser.add_argument("--early_stopping_patience", type=int, default=20)
     parser.add_argument("--early_stopping_metric", type=str, default="macro_f1")
     parser.add_argument("--other_class_weight", type=float, default=0.5)
+    parser.add_argument("--augment_minor", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -998,5 +1146,6 @@ if __name__ == "__main__":
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_metric=args.early_stopping_metric,
         other_class_weight=args.other_class_weight,
+        augment_minor=args.augment_minor,
         seed=args.seed,
     )

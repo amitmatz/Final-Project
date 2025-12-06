@@ -128,21 +128,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Enable on-the-fly data augmentation for minority classes in TRAIN. "
-            "We still keep TRAIN balanced (or class-weighted if --use_class_weights)."
+            "We still keep TRAIN balanced."
         ),
     )
-    # *** IMPORTANT: here is the fix ***
-    # Accept BOTH --use_class_weights AND --train_with_class_weights
+    # אפשר להשאיר את הדגל, אבל לא נעביר אותו הלאה לקוד הקלאסיפיקציה
     parser.add_argument(
         "--use_class_weights",
         "--train_with_class_weights",
         dest="use_class_weights",
         action="store_true",
         help=(
-            "Use class-weighted loss instead of (or in addition to) downsampling. "
-            "When enabled, all TRAIN samples are kept and CrossEntropyLoss uses "
-            "per-class weights. Default (flag off) = perfect class balance via "
-            "downsampling (no weights)."
+            "Currently used only in detection pipeline. For classification we use a fixed "
+            "weight for OTHER inside train_classification.py."
         ),
     )
 
@@ -203,9 +200,9 @@ def main() -> None:
     train_cross_validation(
         data_path=data_path,
         patient_id=args.patient_id,
-        num_folds=int(args.cv_folds),
+        cv_folds=int(args.cv_folds),          # <<< תיקון קריטי
         augment_minor=bool(args.augment_minor),
-        use_class_weights=bool(args.use_class_weights),
+        # לא מעבירים use_class_weights – הקוד בקלאסיפיקציה לא משתמש בזה
         val_per_class=args.val_per_class,
         test_per_class=args.test_per_class,
         device=args.device,

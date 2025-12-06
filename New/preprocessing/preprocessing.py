@@ -3,7 +3,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple
 
 import h5py
 import numpy as np
@@ -36,7 +36,7 @@ def normalize_label(label_str: str) -> str:
     """
     Normalize raw label string into one of: 'HAARYE', 'TUT', 'OTHER'.
 
-    IMPORTANT for you:
+    IMPORTANT:
     - HAARYE stays HAARYE
     - TUT stays TUT
     - AHAV (אהב) is mapped to OTHER
@@ -172,7 +172,7 @@ def load_lfp_signals_from_mat_dir(lfp_dir: str) -> Tuple[np.ndarray, float, List
     all_signals: List[np.ndarray] = []
     channel_names: List[str] = []
 
-    fs = 2000.0  # as seen in your logs
+    fs = 2000.0  # sampling rate (Hz)
 
     for mat_file in mat_files:
         with h5py.File(mat_file, "r") as f:
@@ -265,8 +265,7 @@ def auto_detect_offset_seconds(
     """
     Automatically detect a global offset_sec such that:
         pre_sec <= onset_i + offset_sec <= duration - post_sec
-
-    For as many events as possible.
+    for as many events as possible.
     """
     if not label_events:
         logger.warning("[WARN] No label events provided, using offset_sec=0.0")
@@ -310,7 +309,7 @@ def auto_detect_offset_seconds(
 
 
 # -----------------------------------------------------------------------------
-# Window building – speech events
+# Window building – normalization
 # -----------------------------------------------------------------------------
 def zscore_per_channel(signals: np.ndarray) -> np.ndarray:
     """
@@ -321,6 +320,9 @@ def zscore_per_channel(signals: np.ndarray) -> np.ndarray:
     return (signals - ch_mean) / ch_std
 
 
+# -----------------------------------------------------------------------------
+# Window building – speech events (IMPROVED)
+# -----------------------------------------------------------------------------
 def build_speech_windows(
     signals: np.ndarray,
     fs: float,
@@ -339,6 +341,10 @@ def build_speech_windows(
       - raw_label: original string from file (e.g. 'AHAV')
       - is_speech: True
       - start_time / end_time: in seconds (LFP local time)
+      - event_index: index of the original event in label_events
+      - onset_orig: onset time from labels file (before offset)
+      - offset_orig: offset time from labels file (before offset)
+      - center_time_local: onset + offset_sec (seconds in LFP local time)
     """
     n_channels, n_samples = signals.shape
     logger.info(f"[INFO] Signals shape: {n_channels} channels x {n_samples} samples")
@@ -348,18 +354,26 @@ def build_speech_windows(
 
     windows: List[Dict[str, Any]] = []
 
-    for ev in label_events:
+    total_events = len(label_events)
+    skipped_total = 0
+    skipped_per_label: Dict[str, int] = {}
+
+    for idx, ev in enumerate(label_events):
         raw_label = ev["label"]
         onset = float(ev["onset"])
+        offset_orig = float(ev["offset"])
         normalized = normalize_label(raw_label)
 
-        center_time = onset + offset_sec
+        center_time = onset + offset_sec  # local LFP time (sec)
         center_idx = int(round(center_time * fs))
 
         start_idx = center_idx - pre_samples
         end_idx = center_idx + post_samples
 
+        # Out of bounds? Skip and log statistics (aggregated).
         if start_idx < 0 or end_idx > n_samples:
+            skipped_total += 1
+            skipped_per_label[normalized] = skipped_per_label.get(normalized, 0) + 1
             continue
 
         window_signals = signals[:, start_idx:end_idx].T.astype(np.float32)
@@ -371,14 +385,38 @@ def build_speech_windows(
             "is_speech": True,
             "start_time": float(start_idx / fs),
             "end_time": float(end_idx / fs),
+            "event_index": idx,
+            "onset_orig": onset,
+            "offset_orig": offset_orig,
+            "center_time_local": float(center_time),
         }
         windows.append(win)
+
+    kept = len(windows)
+    kept_pct = 100.0 * kept / total_events if total_events > 0 else 0.0
+
+    logger.info(
+        "[INFO] Speech windows built: %d / %d events (%.2f%% kept)",
+        kept,
+        total_events,
+        kept_pct,
+    )
+
+    if skipped_total > 0:
+        logger.warning(
+            "[WARN] Skipped %d speech events due to window bounds (pre_sec=%.3f, post_sec=%.3f).",
+            skipped_total,
+            pre_sec,
+            post_sec,
+        )
+        for lbl, cnt in sorted(skipped_per_label.items()):
+            logger.warning("[WARN]   Skipped %d events for label '%s'", cnt, lbl)
 
     return windows
 
 
 # -----------------------------------------------------------------------------
-# Window building – background (unlabeled) OTHER
+# Window building – background (unlabeled) OTHER (IMPROVED)
 # -----------------------------------------------------------------------------
 def build_background_windows(
     signals: np.ndarray,
@@ -391,7 +429,7 @@ def build_background_windows(
     target_other_total: int,
 ) -> List[Dict[str, Any]]:
     """
-    Build OTHER windows from *unlabeled* segments (r̄eal background).
+    Build OTHER windows from *unlabeled* segments (real background).
 
     Idea:
       - Take gaps between labeled speech segments (plus before first and after last)
@@ -400,6 +438,12 @@ def build_background_windows(
       - Stop once OTHER total reaches target_other_total.
     """
     if target_other_total <= base_other_count:
+        logger.info(
+            "[INFO] No need to add background OTHER windows "
+            "(base_other=%d, target_other_total=%d).",
+            base_other_count,
+            target_other_total,
+        )
         return []
 
     max_additional = target_other_total - base_other_count
@@ -411,14 +455,14 @@ def build_background_windows(
     step_sec = win_len  # non-overlapping background windows
 
     # Convert label events to local LFP times
-    events_local = []
+    events_local: List[Tuple[float, float]] = []
     for ev in label_events:
         onset_local = float(ev["onset"]) + offset_sec
         offset_local = float(ev["offset"]) + offset_sec
         events_local.append((onset_local, offset_local))
 
     if not events_local:
-        # no labels? take windows across entire recording
+        # No labels — take windows across entire recording
         gap_intervals = [(0.0, duration)]
     else:
         events_local.sort(key=lambda x: x[0])
@@ -442,10 +486,17 @@ def build_background_windows(
         if duration - last_off > margin:
             gap_intervals.append((last_off + margin, duration))
 
+    logger.info(
+        "[INFO] Background gap intervals found: %d (duration=%.3f sec, win_len=%.3f sec)",
+        len(gap_intervals),
+        duration,
+        win_len,
+    )
+
     bg_windows: List[Dict[str, Any]] = []
 
     for (gap_start, gap_end) in gap_intervals:
-        # start placing centers so that full window is inside gap
+        # Start placing centers so that full window is inside gap
         center = gap_start + pre_sec
         while center + post_sec <= gap_end and len(bg_windows) < max_additional:
             center_idx = int(round(center * fs))
@@ -472,6 +523,23 @@ def build_background_windows(
 
         if len(bg_windows) >= max_additional:
             break
+
+    logger.info(
+        "[INFO] Background OTHER windows: base=%d, target_total=%d, "
+        "requested_additional=%d, built=%d",
+        base_other_count,
+        target_other_total,
+        max_additional,
+        len(bg_windows),
+    )
+
+    if len(bg_windows) < max_additional:
+        logger.warning(
+            "[WARN] Could not reach target OTHER count from background gaps. "
+            "Requested additional=%d, built=%d.",
+            max_additional,
+            len(bg_windows),
+        )
 
     return bg_windows
 
@@ -559,8 +627,16 @@ def main() -> None:
     signals, fs, channel_names = load_lfp_signals_from_mat_dir(lfp_dir)
     n_channels, n_samples = signals.shape
 
+    logger.info(
+        "[INFO] Loaded LFP signals: %d channels, %d samples (fs=%.2f Hz)",
+        n_channels,
+        n_samples,
+        fs,
+    )
+
     # Z-score per channel
     signals = zscore_per_channel(signals)
+    logger.info("[INFO] Applied per-channel z-score normalization to raw LFP signals.")
 
     # Load labels
     label_events = load_label_events(labels_path)
@@ -573,6 +649,22 @@ def main() -> None:
         pre_sec=args.pre_sec,
         post_sec=args.post_sec,
     )
+
+    # Richer logging around offset and event times
+    logger.info("[INFO] Using offset_sec = %.3f s", offset_sec)
+
+    duration_sec = n_samples / fs
+    logger.info("[INFO] Recording duration (LFP): %.3f sec", duration_sec)
+
+    if label_events:
+        onsets_local = [float(ev["onset"]) + offset_sec for ev in label_events]
+        logger.info(
+            "[INFO] Local onset range after offset: [%.3f, %.3f] sec",
+            min(onsets_local),
+            max(onsets_local),
+        )
+    else:
+        logger.warning("[WARN] No label events to report onset range for.")
 
     # Build speech windows (HAARYE / AHAV→OTHER / TUT)
     speech_windows = build_speech_windows(
@@ -601,7 +693,14 @@ def main() -> None:
 
     # We want OTHER to be (slightly) the largest class, but not crazy:
     # e.g., ~20% more than the largest among HAARYE/TUT.
-    target_other_total = int(1.2 * max_main_class)
+    target_other_total = int(1.2 * max_main_class) if max_main_class > 0 else base_other
+
+    logger.info(
+        "[INFO] Target OTHER count: base_other=%d, max_main_class=%d, target_other_total=%d",
+        base_other,
+        max_main_class,
+        target_other_total,
+    )
 
     # Build background OTHER windows from unlabeled gaps
     bg_windows = build_background_windows(

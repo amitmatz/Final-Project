@@ -56,8 +56,8 @@ def ensure_classification_data(patient_id: str, force_preproc: bool) -> str:
     """
     Ensure that processed_data/{patient_id}_classification_data.npy exists.
     If it exists and force_preproc=False -> use it.
-    If it does not exist OR force_preproc=True -> try to call preprocessing,
-    or raise a clear error telling the user what to do.
+    If it does not exist OR force_preproc=True -> call preprocessing
+    (or raise) with a clear error message.
     """
     base_dir = os.path.dirname(os.path.abspath(__file__))
     processed_dir = os.path.join(base_dir, "processed_data")
@@ -131,7 +131,7 @@ def parse_args() -> argparse.Namespace:
             "We still keep TRAIN balanced."
         ),
     )
-    # אפשר להשאיר את הדגל, אבל לא נעביר אותו הלאה לקוד הקלאסיפיקציה
+    # We keep this flag for compatibility, but do not pass it to the classification code.
     parser.add_argument(
         "--use_class_weights",
         "--train_with_class_weights",
@@ -200,9 +200,9 @@ def main() -> None:
     train_cross_validation(
         data_path=data_path,
         patient_id=args.patient_id,
-        cv_folds=int(args.cv_folds),          # <<< תיקון קריטי
+        cv_folds=int(args.cv_folds),
         augment_minor=bool(args.augment_minor),
-        # לא מעבירים use_class_weights – הקוד בקלאסיפיקציה לא משתמש בזה
+        # We do not pass use_class_weights – classification code does not use it.
         val_per_class=args.val_per_class,
         test_per_class=args.test_per_class,
         device=args.device,

@@ -380,6 +380,196 @@ def augment_signals_gaussian(x: np.ndarray, noise_std: float = 0.05) -> np.ndarr
     return x + noise
 
 
+def random_augment_sample(
+    sample: np.ndarray,
+    noise_std: float = 0.05,
+    max_time_shift_steps: int = 2,
+    is_haarye: bool = False,
+) -> np.ndarray:
+    """
+    Apply random data augmentation to a single sample.
+
+    sample shape is expected to be (seq_len, feat_dim).
+    Augmentations:
+      - Optional small circular time shift.
+      - Additive Gaussian noise.
+
+    For HAARYE samples (is_haarye=True), we use milder and more
+    variable augmentation to avoid over-perturbation and exact repeats.
+    """
+    x = np.array(sample, dtype=np.float32, copy=True)
+    seq_len = x.shape[0]
+
+    # Default parameters
+    eff_noise_std = noise_std
+    eff_max_shift = max_time_shift_steps
+
+    # Softer augmentation for HAARYE
+    if is_haarye:
+        eff_noise_std = noise_std * 0.5
+        eff_max_shift = max(1, max_time_shift_steps // 2) if max_time_shift_steps > 0 else 0
+
+        # For HAARYE we do not always apply both transformations: this
+        # reduces repetition while keeping perturbations mild.
+        # 50% chance to apply time shift, 70% chance to add noise.
+        if eff_max_shift > 0 and seq_len > 1 and np.random.rand() < 0.5:
+            shift = np.random.randint(-eff_max_shift, eff_max_shift + 1)
+            if shift != 0:
+                x = np.roll(x, shift=shift, axis=0)
+
+        if eff_noise_std > 0.0 and np.random.rand() < 0.7:
+            noise = np.random.normal(
+                loc=0.0,
+                scale=eff_noise_std,
+                size=x.shape,
+            ).astype(np.float32)
+            x = x + noise
+
+        return x.astype(np.float32)
+
+    # Original behavior for non-HAARYE classes
+    if eff_max_shift > 0 and seq_len > 1:
+        shift = np.random.randint(-eff_max_shift, eff_max_shift + 1)
+        if shift != 0:
+            x = np.roll(x, shift=shift, axis=0)
+
+    if eff_noise_std > 0.0:
+        noise = np.random.normal(loc=0.0, scale=eff_noise_std, size=x.shape).astype(
+            np.float32
+        )
+        x = x + noise
+
+    return x.astype(np.float32)
+
+
+def build_balanced_train_set(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    augment_minor: bool,
+    logger,
+    noise_std: float = 0.05,
+    max_time_shift_steps: int = 2,
+    haarye_class_id: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Balance the TRAIN set.
+
+    If augment_minor is False:
+        - Downsample all classes to the smallest class (old behavior).
+
+    If augment_minor is True:
+        - Keep ALL samples of the largest class.
+        - For smaller classes, generate augmented samples until each class
+          has the same number of samples as the largest class.
+        - Augmentation is done using random_augment_sample, so generated
+          samples are not identical copies.
+        - For HAARYE (if haarye_class_id is provided), augmentation is softer
+          and more varied, but the target count is still max_count (no
+          reduction in group size).
+    """
+    classes = np.unique(y_train)
+    class_to_indices: Dict[int, List[int]] = {
+        int(c): np.where(y_train == c)[0].tolist() for c in classes
+    }
+    raw_counts = {c: len(idxs) for c, idxs in class_to_indices.items()}
+
+    if not augment_minor:
+        # Old behavior: downsampling to minimal class size
+        min_count = min(raw_counts.values())
+        logger.info(
+            "INFO: Balancing TRAIN by DOWNsampling to smallest class: "
+            "min_count=%d, raw_counts=%s",
+            min_count,
+            raw_counts,
+        )
+
+        new_X: List[np.ndarray] = []
+        new_y: List[int] = []
+
+        for c in classes:
+            c_int = int(c)
+            idxs = class_to_indices[c_int]
+            if len(idxs) > min_count:
+                chosen = np.random.choice(idxs, size=min_count, replace=False)
+            else:
+                chosen = np.array(idxs, dtype=int)
+
+            for idx in chosen:
+                new_X.append(X_train[idx])
+                new_y.append(c_int)
+
+        new_X_arr = np.stack(new_X).astype(np.float32)
+        new_y_arr = np.array(new_y, dtype=np.int64)
+        return new_X_arr, new_y_arr
+
+    # New behavior when augment_minor == True
+    max_count = max(raw_counts.values())
+    logger.info(
+        "INFO: Balancing TRAIN by UPsampling minority classes with data augmentation "
+        "to max_count=%d, raw_counts=%s",
+        max_count,
+        raw_counts,
+    )
+
+    if haarye_class_id is not None:
+        logger.info("INFO: HAARYE class id detected for special augmentation: %d", haarye_class_id)
+
+    new_X: List[np.ndarray] = []
+    new_y: List[int] = []
+
+    for c in classes:
+        c_int = int(c)
+        idxs = class_to_indices[c_int]
+        current_count = len(idxs)
+
+        # Keep all original samples
+        for idx in idxs:
+            new_X.append(X_train[idx])
+            new_y.append(c_int)
+
+        if current_count == max_count:
+            # Majority class - nothing to augment
+            continue
+
+        needed = max_count - current_count
+        logger.info(
+            "INFO: Class %d: current_count=%d, augmenting with %d synthetic samples.",
+            c_int,
+            current_count,
+            needed,
+        )
+
+        idxs_array = np.array(idxs, dtype=int)
+        is_haarye_class = haarye_class_id is not None and c_int == haarye_class_id
+
+        for _ in range(needed):
+            base_idx = int(np.random.choice(idxs_array))
+            base_sample = X_train[base_idx]
+            aug_sample = random_augment_sample(
+                base_sample,
+                noise_std=noise_std,
+                max_time_shift_steps=max_time_shift_steps,
+                is_haarye=is_haarye_class,
+            )
+            new_X.append(aug_sample)
+            new_y.append(c_int)
+
+    new_X_arr = np.stack(new_X).astype(np.float32)
+    new_y_arr = np.array(new_y, dtype=np.int64)
+
+    if logger is not None:
+        final_counts = {
+            int(c): int((new_y_arr == c).sum()) for c in np.unique(new_y_arr)
+        }
+        logger.info(
+            "INFO: [Balanced TRAIN] Final per-class counts (after augmentation):"
+        )
+        for c_int in sorted(final_counts.keys()):
+            logger.info("INFO:   class %d: %d", c_int, final_counts[c_int])
+
+    return new_X_arr, new_y_arr
+
+
 # ===========================================================================
 # Cyclic stratified CV splitter (VAL → TEST → TRAIN rotation)
 # ===========================================================================
@@ -458,7 +648,7 @@ def build_cyclic_stratified_folds(
         "INFO: Maximum possible CV folds (global, all classes): %d", max_possible_folds
     )
 
-    # אם ביקשנו יותר מהאפשרי – נעצור עם שגיאה ברורה ולא נחתוך בשקט
+    # If requested more folds than possible – raise an error
     if cv_folds > max_possible_folds:
         logger.error(
             "ERROR: Requested cv_folds=%d but maximum possible without reusing "
@@ -600,63 +790,52 @@ def train_one_fold(
         count_c = int((y[train_idx] == c).sum())
         logger.info("INFO:   %s: %d", idx_to_label[c], count_c)
 
-    # Balance TRAIN by DOWNsampling to smallest class (after removing VAL/TEST)
-    train_labels = y[train_idx]
-    per_class_indices: Dict[int, np.ndarray] = {}
-    for c in range(n_classes):
-        per_class_indices[c] = train_idx[train_labels == c]
-
-    min_count = min(len(v) for v in per_class_indices.values())
-    logger.info(
-        "INFO: Balancing TRAIN by DOWNsampling to smallest class: min_count=%d, raw_counts=%s",
-        min_count,
-        {c: len(v) for c, v in per_class_indices.items()},
-    )
-
-    rng = np.random.RandomState(42 + fold_idx)
-    balanced_train_indices: List[int] = []
-    for c in range(n_classes):
-        idxs = per_class_indices[c]
-        if len(idxs) > min_count:
-            chosen = rng.choice(idxs, size=min_count, replace=False)
-        else:
-            chosen = idxs
-        balanced_train_indices.extend(chosen.tolist())
-
-    balanced_train_indices = np.array(sorted(balanced_train_indices), dtype=np.int64)
-
-    logger.info("INFO: [Fold %d] TRAIN per-class counts AFTER balancing:", fold_idx + 1)
-    for c in range(n_classes):
-        count_c = int((y[balanced_train_indices] == c).sum())
-        logger.info("INFO:   %s: %d", idx_to_label[c], count_c)
-
-    logger.info("INFO: [Fold %d] VAL per-class counts (unchanged):", fold_idx + 1)
-    for c in range(n_classes):
-        count_c = int((y[val_idx] == c).sum())
-        logger.info("INFO:   %s: %d", idx_to_label[c], count_c)
-
-    # Extract data
-    X_train = X[balanced_train_indices].copy()
-    y_train = y[balanced_train_indices].copy()
+    # Extract raw TRAIN/VAL/TEST
+    X_train_raw = X[train_idx].copy()
+    y_train_raw = y[train_idx].copy()
     X_val = X[val_idx]
     y_val = y[val_idx]
     X_test = X[test_idx]
     y_test = y[test_idx]
 
-    # Data augmentation (optional) – keep class balance
+    # Detect HAARYE class index (if present) for class-specific augmentation control
+    haarye_class_id: Optional[int] = None
+    for c_idx, name in idx_to_label.items():
+        if name.upper() == "HAARYE":
+            haarye_class_id = c_idx
+            break
+
+    # Build balanced TRAIN set (downsample or upsample+augment depending on augment_minor)
+    X_train, y_train = build_balanced_train_set(
+        X_train=X_train_raw,
+        y_train=y_train_raw,
+        augment_minor=augment_minor,
+        logger=logger,
+        noise_std=0.05,
+        max_time_shift_steps=2,
+        haarye_class_id=haarye_class_id,
+    )
+
     if augment_minor:
         logger.info(
-            "INFO: [Fold %d] Data augmentation ENABLED (Gaussian noise on non-OTHER classes).",
+            "INFO: [Fold %d] Data augmentation ENABLED (upsampling minority classes to largest class with random noise/time-shift).",
             fold_idx + 1,
         )
-        for c_idx, name in idx_to_label.items():
-            if name.upper() == "OTHER":
-                continue
-            mask_c = y_train == c_idx
-            if mask_c.sum() > 0:
-                X_train[mask_c] = augment_signals_gaussian(X_train[mask_c])
     else:
-        logger.info("INFO: [Fold %d] Augmentation DISABLED for this fold.", fold_idx + 1)
+        logger.info(
+            "INFO: [Fold %d] Data augmentation DISABLED (using downsampling to smallest class).",
+            fold_idx + 1,
+        )
+
+    logger.info("INFO: [Fold %d] TRAIN per-class counts AFTER balancing:", fold_idx + 1)
+    for c in range(n_classes):
+        count_c = int((y_train == c).sum())
+        logger.info("INFO:   %s: %d", idx_to_label[c], count_c)
+
+    logger.info("INFO: [Fold %d] VAL per-class counts (unchanged):", fold_idx + 1)
+    for c in range(n_classes):
+        count_c = int((y_val == c).sum())
+        logger.info("INFO:   %s: %d", idx_to_label[c], count_c)
 
     seq_len = X.shape[1]
     feat_dim = X.shape[2]
@@ -686,7 +865,7 @@ def train_one_fold(
 
     # Model
     num_classes = len(idx_to_label)
-    # חשוב: קריאה במיקום בלבד כדי להתאים גם ל-model.py שלך
+    # Positional arguments only to match external model signatures as well
     model = LSTMClassifier(
         feat_dim,
         hidden_size,
@@ -905,10 +1084,10 @@ def train_one_fold(
 def train_cross_validation(
     data_path: str,
     patient_id: str = "Unknown",
-    cv_folds: int = 5,
+    cv_folds: int = 36,
     val_per_class: int = 1,
     test_per_class: int = 1,
-    num_epochs: int = 100,
+    num_epochs: int = 200,
     batch_size: int = 64,
     learning_rate: float = 1e-3,
     weight_decay: float = 1e-4,
@@ -917,9 +1096,9 @@ def train_cross_validation(
     bidirectional: bool = False,
     dropout: float = 0.3,
     use_early_stopping: bool = True,
-    early_stopping_patience: int = 20,
+    early_stopping_patience: int = 15,
     early_stopping_metric: str = "macro_f1",
-    other_class_weight: float = 0.5,
+    other_class_weight: float = 0.8,
     augment_minor: bool = False,
     seed: int = 42,
     device: Optional[str] = None,
@@ -931,15 +1110,17 @@ def train_cross_validation(
 
     - LSTM-based classifier.
     - Cyclic CV: samples move VAL -> TEST -> TRAIN without reuse of VAL/TEST.
-    - TRAIN is balanced by downsampling to the smallest class (after removing VAL/TEST).
-    - Optional data augmentation (Gaussian noise) with augment_minor.
+    - TRAIN is balanced either by downsampling to the smallest class
+      or by upsampling minority classes with data augmentation (augment_minor).
     - Macro-F1 is used as early stopping metric by default.
     - OTHER class handled via loss weight.
     """
-    # תמיכה לאחור: אם main עדיין מעביר num_folds – נשתמש בו כ-cv_folds
+    # Backward compatibility: if main still passes num_folds – use it as cv_folds
     if "num_folds" in kwargs:
         old = kwargs.pop("num_folds")
-        logger.info("INFO: Received num_folds=%s in kwargs, overriding cv_folds=%d", old, cv_folds)
+        logger.info(
+            "INFO: Received num_folds=%s in kwargs, overriding cv_folds=%d", old, cv_folds
+        )
         cv_folds = int(old)
 
     # ignore any remaining extra args
@@ -1077,7 +1258,7 @@ def train_cross_validation(
         overall_macro_f1 * 100.0,
     )
 
-    # ========= T-TEST (מול baseline accuracy) =========
+    # ========= T-TEST vs baseline accuracy =========
     if len(test_accs) > 1:
         try:
             from scipy.stats import ttest_1samp
@@ -1110,7 +1291,7 @@ if __name__ == "__main__":
     parser.add_argument("--cv_folds", type=int, default=5)
     parser.add_argument("--val_per_class", type=int, default=1)
     parser.add_argument("--test_per_class", type=int, default=1)
-    parser.add_argument("--num_epochs", type=int, default=50)
+    parser.add_argument("--num_epochs", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)

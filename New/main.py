@@ -79,15 +79,47 @@ def ensure_classification_data(patient_id: str, force_preproc: bool) -> str:
     )
 
     try:
-        # You can adapt this import/function name to match your actual preprocessing API.
+        # First try regular package-style import
         from preprocessing.preprocessing import run_classification_preprocessing
     except ImportError:
-        LOGGER.error(
-            "[FATAL] Could not import 'run_classification_preprocessing' from "
-            "'preprocessing.preprocessing'. Please regenerate the "
-            f"{patient_id}_classification_data.npy file manually."
+        LOGGER.warning(
+            "[WARN] Could not import run_classification_preprocessing via "
+            "'from preprocessing.preprocessing import ...'. "
+            "Falling back to path-based dynamic import."
         )
-        raise
+
+        import importlib.util
+
+        module_path = os.path.join(base_dir, "preprocessing", "preprocessing.py")
+        if not os.path.exists(module_path):
+            LOGGER.error(
+                f"[FATAL] preprocessing.py not found at: {module_path}"
+            )
+            raise FileNotFoundError(module_path)
+
+        spec = importlib.util.spec_from_file_location(
+            "classification_preproc", module_path
+        )
+        if spec is None or spec.loader is None:
+            LOGGER.error(
+                "[FATAL] Failed to load spec for preprocessing/preprocessing.py"
+            )
+            raise RuntimeError("Failed to load preprocessing module spec")
+
+        preproc_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(preproc_module)  # type: ignore[arg-type]
+
+        if not hasattr(preproc_module, "run_classification_preprocessing"):
+            LOGGER.error(
+                "[FATAL] 'preprocessing/preprocessing.py' does not define "
+                "run_classification_preprocessing()"
+            )
+            raise AttributeError(
+                "run_classification_preprocessing not found in preprocessing module"
+            )
+
+        run_classification_preprocessing = preproc_module.run_classification_preprocessing
+
 
     # Call the preprocessing function
     run_classification_preprocessing(patient_id=patient_id)

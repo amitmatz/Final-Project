@@ -211,11 +211,15 @@ def _infer_label_field(sample: Dict[str, Any]) -> str:
 
 def load_classification_data(
     data_path: str,
-    pool_size: int = 125,
+    pool_size: int = 50,
     class_map: Optional[Dict[str, int]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[int, str], Dict[str, int]]:
     """
     Load classification data from the .npy produced in preprocessing.
+
+    Temporal pooling is applied with pool_size (less aggressive by default).
+    No normalization is performed here – normalization is done per-fold using
+    only the TRAIN set to avoid information leakage.
 
     Returns:
         X:  (N, seq_len, feat_dim)
@@ -340,19 +344,8 @@ def load_classification_data(
     # Map labels to integers
     y = np.array([label_to_idx[s] for s in labels_str], dtype=np.int64)
 
-    # Global Z-score per channel
-    X_2d = X.reshape(-1, feat_dim)
-    mean = X_2d.mean(axis=0, keepdims=True)
-    std = X_2d.std(axis=0, keepdims=True) + 1e-6
-    X_norm = (X_2d - mean) / std
-    X_norm = X_norm.reshape(X.shape)
-
-    logger.info(
-        "INFO: Applied global per-channel Z-score normalization after temporal pooling."
-    )
-
-    logger.info("INFO: [LOAD] Final class counts after normalization:")
-    total_samples = X_norm.shape[0]
+    logger.info("INFO: [LOAD] Final class counts (raw, before normalization):")
+    total_samples = X.shape[0]
     for idx, name in idx_to_label.items():
         count = int((y == idx).sum())
         logger.info("INFO:   %s: %d", name, count)
@@ -363,7 +356,7 @@ def load_classification_data(
         count = int((y == idx).sum())
         logger.info("INFO:   %s: %d", name, count)
 
-    return X_norm, y, idx_to_label, label_to_idx
+    return X.astype(np.float32), y, idx_to_label, label_to_idx
 
 
 # ===========================================================================
@@ -372,12 +365,50 @@ def load_classification_data(
 
 
 def augment_signals_gaussian(x: np.ndarray, noise_std: float = 0.05) -> np.ndarray:
-    """
-    Add small Gaussian noise to signals.
-    x: (N, seq_len, feat_dim)
-    """
     noise = np.random.normal(0.0, noise_std, size=x.shape).astype(np.float32)
     return x + noise
+
+
+def _apply_time_envelope(x: np.ndarray) -> np.ndarray:
+    """
+    Smooth random time-varying gain envelope.
+    """
+    seq_len = x.shape[0]
+    if seq_len <= 1:
+        return x
+
+    num_knots = 4
+    knot_positions = np.linspace(0, seq_len - 1, num_knots)
+    knot_gains = np.random.uniform(0.8, 1.2, size=num_knots)
+    t = np.arange(seq_len)
+    envelope = np.interp(t, knot_positions, knot_gains).reshape(-1, 1)
+    return x * envelope.astype(np.float32)
+
+
+def _simple_time_warp(x: np.ndarray, max_warp: float = 0.1) -> np.ndarray:
+    """
+    Simple time warping by resampling the sequence length slightly.
+    """
+    seq_len, feat_dim = x.shape
+    if seq_len <= 2 or max_warp <= 0.0:
+        return x
+
+    factor = 1.0 + np.random.uniform(-max_warp, max_warp)
+    new_len = max(2, int(round(seq_len * factor)))
+
+    orig_t = np.linspace(0.0, 1.0, seq_len)
+    new_t = np.linspace(0.0, 1.0, new_len)
+
+    x_resampled = np.zeros((new_len, feat_dim), dtype=np.float32)
+    for ch in range(feat_dim):
+        x_resampled[:, ch] = np.interp(new_t, orig_t, x[:, ch])
+
+    final = np.zeros_like(x, dtype=np.float32)
+    back_t = np.linspace(0.0, 1.0, seq_len)
+    for ch in range(feat_dim):
+        final[:, ch] = np.interp(back_t, np.linspace(0.0, 1.0, new_len), x_resampled[:, ch])
+
+    return final
 
 
 def random_augment_sample(
@@ -387,36 +418,26 @@ def random_augment_sample(
     is_haarye: bool = False,
 ) -> np.ndarray:
     """
-    Apply random data augmentation to a single sample.
-
-    sample shape is expected to be (seq_len, feat_dim).
-    Augmentations:
-      - Optional small circular time shift.
-      - Additive Gaussian noise.
-
-    For HAARYE samples (is_haarye=True), we use milder and more
-    variable augmentation to avoid over-perturbation and exact repeats.
+    Structural + noise augmentations.
     """
     x = np.array(sample, dtype=np.float32, copy=True)
     seq_len = x.shape[0]
 
-    # Default parameters
     eff_noise_std = noise_std
     eff_max_shift = max_time_shift_steps
 
-    # Softer augmentation for HAARYE
     if is_haarye:
         eff_noise_std = noise_std * 0.5
         eff_max_shift = max(1, max_time_shift_steps // 2) if max_time_shift_steps > 0 else 0
 
-        # For HAARYE we do not always apply both transformations: this
-        # reduces repetition while keeping perturbations mild.
-        # 50% chance to apply time shift, 70% chance to add noise.
+        if np.random.rand() < 0.4:
+            x = _simple_time_warp(x, max_warp=0.08)
+        if np.random.rand() < 0.5:
+            x = _apply_time_envelope(x)
         if eff_max_shift > 0 and seq_len > 1 and np.random.rand() < 0.5:
             shift = np.random.randint(-eff_max_shift, eff_max_shift + 1)
             if shift != 0:
                 x = np.roll(x, shift=shift, axis=0)
-
         if eff_noise_std > 0.0 and np.random.rand() < 0.7:
             noise = np.random.normal(
                 loc=0.0,
@@ -427,7 +448,11 @@ def random_augment_sample(
 
         return x.astype(np.float32)
 
-    # Original behavior for non-HAARYE classes
+    if np.random.rand() < 0.3:
+        x = _simple_time_warp(x, max_warp=0.1)
+    if np.random.rand() < 0.5:
+        x = _apply_time_envelope(x)
+
     if eff_max_shift > 0 and seq_len > 1:
         shift = np.random.randint(-eff_max_shift, eff_max_shift + 1)
         if shift != 0:
@@ -452,20 +477,9 @@ def build_balanced_train_set(
     haarye_class_id: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Balance the TRAIN set.
-
-    If augment_minor is False:
-        - Downsample all classes to the smallest class (old behavior).
-
-    If augment_minor is True:
-        - Keep ALL samples of the largest class.
-        - For smaller classes, generate augmented samples until each class
-          has the same number of samples as the largest class.
-        - Augmentation is done using random_augment_sample, so generated
-          samples are not identical copies.
-        - For HAARYE (if haarye_class_id is provided), augmentation is softer
-          and more varied, but the target count is still max_count (no
-          reduction in group size).
+    Balance TRAIN set:
+      - if augment_minor=False: downsample to smallest class
+      - if augment_minor=True: upsample minorities with augmentation to largest class
     """
     classes = np.unique(y_train)
     class_to_indices: Dict[int, List[int]] = {
@@ -474,7 +488,6 @@ def build_balanced_train_set(
     raw_counts = {c: len(idxs) for c, idxs in class_to_indices.items()}
 
     if not augment_minor:
-        # Old behavior: downsampling to minimal class size
         min_count = min(raw_counts.values())
         logger.info(
             "INFO: Balancing TRAIN by DOWNsampling to smallest class: "
@@ -502,7 +515,6 @@ def build_balanced_train_set(
         new_y_arr = np.array(new_y, dtype=np.int64)
         return new_X_arr, new_y_arr
 
-    # New behavior when augment_minor == True
     max_count = max(raw_counts.values())
     logger.info(
         "INFO: Balancing TRAIN by UPsampling minority classes with data augmentation "
@@ -512,7 +524,10 @@ def build_balanced_train_set(
     )
 
     if haarye_class_id is not None:
-        logger.info("INFO: HAARYE class id detected for special augmentation: %d", haarye_class_id)
+        logger.info(
+            "INFO: HAARYE class id detected for special augmentation: %d",
+            haarye_class_id,
+        )
 
     new_X: List[np.ndarray] = []
     new_y: List[int] = []
@@ -522,13 +537,11 @@ def build_balanced_train_set(
         idxs = class_to_indices[c_int]
         current_count = len(idxs)
 
-        # Keep all original samples
         for idx in idxs:
             new_X.append(X_train[idx])
             new_y.append(c_int)
 
         if current_count == max_count:
-            # Majority class - nothing to augment
             continue
 
         needed = max_count - current_count
@@ -584,15 +597,12 @@ def build_cyclic_stratified_folds(
     seed: int = 42,
 ) -> List[Dict[str, np.ndarray]]:
     """
-    Build cyclic stratified folds with per-class control on VAL/TEST samples.
+    Cyclic stratified folds with per-class control on VAL/TEST samples.
 
-    For each class c:
-      - We compute the maximum number of folds we can create
-        without reusing VAL samples of that class.
-      - If the requested cv_folds exceeds the global maximum possible
-        (across all classes), we raise an error with an explanation.
-      - Within the allowed number of folds, chunks for VAL/TEST are disjoint,
-        so no sample is used twice in VAL or twice in TEST.
+    Constraints:
+      - In each fold, VAL and TEST are disjoint.
+      - Across all folds, each sample appears in VAL at most once
+        and in TEST at most once.
     """
     if val_per_class <= 0:
         raise ValueError("val_per_class must be > 0.")
@@ -605,7 +615,6 @@ def build_cyclic_stratified_folds(
         )
 
     rng = np.random.RandomState(seed)
-    n_classes = len(label_to_idx)
     all_indices = np.arange(len(y))
 
     class_indices: Dict[int, np.ndarray] = {}
@@ -617,7 +626,6 @@ def build_cyclic_stratified_folds(
         test_per_class,
     )
 
-    # 1) Per-class max folds (no reuse of VAL samples)
     for label_str, label_idx in label_to_idx.items():
         idxs = np.where(y == label_idx)[0]
         rng.shuffle(idxs)
@@ -648,7 +656,6 @@ def build_cyclic_stratified_folds(
         "INFO: Maximum possible CV folds (global, all classes): %d", max_possible_folds
     )
 
-    # If requested more folds than possible – raise an error
     if cv_folds > max_possible_folds:
         logger.error(
             "ERROR: Requested cv_folds=%d but maximum possible without reusing "
@@ -666,12 +673,10 @@ def build_cyclic_stratified_folds(
 
     folds: List[Dict[str, np.ndarray]] = []
 
-    # 2) Build folds
     for f in range(F):
         val_inds: List[int] = []
         test_inds: List[int] = []
 
-        # iterate classes in index order
         for _, label_idx in sorted(label_to_idx.items(), key=lambda x: x[1]):
             idxs = class_indices[label_idx]
             max_folds_c = max_folds_per_class[label_idx]
@@ -682,24 +687,28 @@ def build_cyclic_stratified_folds(
             needed = max_folds_c * chunk_size
             idxs_use = idxs[:needed]
 
-            # split idxs_use into max_folds_c equal chunks
             chunks = np.split(idxs_use, max_folds_c)
 
-            # VAL for this fold from chunk f
             if len(chunks[f]) < val_per_class:
                 continue
             val_c = chunks[f][:val_per_class]
 
-            # TEST for this fold from next chunk cyclically
             test_chunk = chunks[(f + 1) % max_folds_c]
             test_c = test_chunk[:test_per_class] if test_per_class > 0 else []
 
             val_inds.extend(val_c.tolist())
             if test_per_class > 0:
-                test_inds.extend(test_c.tolist())
+                test_inds.extend(list(test_c))
 
         val_inds = np.array(sorted(val_inds), dtype=np.int64)
         test_inds = np.array(sorted(test_inds), dtype=np.int64)
+
+        overlap = np.intersect1d(val_inds, test_inds)
+        if overlap.size > 0:
+            raise ValueError(
+                f"Internal error: VAL and TEST overlap in fold {f + 1} "
+                f"(overlap size={overlap.size})."
+            )
 
         mask = np.ones(len(y), dtype=bool)
         mask[val_inds] = False
@@ -753,9 +762,12 @@ def train_one_fold(
     early_stopping_metric: str,
     other_class_weight: float,
     augment_minor: bool,
+    use_class_weights: bool,
 ) -> Dict[str, Any]:
     """
     Train one CV fold and return metrics & best model state.
+    Normalization is computed using TRAIN only in this fold and
+    applied to TRAIN/VAL/TEST to avoid data leakage.
     """
     train_idx = fold_splits["train"]
     val_idx = fold_splits["val"]
@@ -772,7 +784,7 @@ def train_one_fold(
 
     def log_counts(indices: np.ndarray, name: str) -> None:
         logger.info(
-            "INFO: [Fold %d] %s (raw, before training) per-class counts:",
+            "INFO: [Fold %d] %s (raw, before normalization/balance) per-class counts:",
             fold_idx + 1,
             name,
         )
@@ -783,31 +795,50 @@ def train_one_fold(
     log_counts(val_idx, "VAL")
     log_counts(test_idx, "TEST")
     logger.info(
-        "INFO: [Fold %d] TRAIN (raw, before balance/augmentation) per-class counts:",
+        "INFO: [Fold %d] TRAIN (raw, before normalization/balance) per-class counts:",
         fold_idx + 1,
     )
     for c in range(n_classes):
         count_c = int((y[train_idx] == c).sum())
         logger.info("INFO:   %s: %d", idx_to_label[c], count_c)
 
-    # Extract raw TRAIN/VAL/TEST
     X_train_raw = X[train_idx].copy()
     y_train_raw = y[train_idx].copy()
-    X_val = X[val_idx]
-    y_val = y[val_idx]
-    X_test = X[test_idx]
-    y_test = y[test_idx]
+    X_val_raw = X[val_idx].copy()
+    y_val = y[val_idx].copy()
+    X_test_raw = X[test_idx].copy()
+    y_test = y[test_idx].copy()
 
-    # Detect HAARYE class index (if present) for class-specific augmentation control
+    seq_len = X.shape[1]
+    feat_dim = X.shape[2]
+
+    X_train_2d = X_train_raw.reshape(-1, feat_dim)
+    mean = X_train_2d.mean(axis=0, keepdims=True)
+    std = X_train_2d.std(axis=0, keepdims=True) + 1e-6
+
+    def _normalize_subset(x_subset: np.ndarray) -> np.ndarray:
+        x2d = x_subset.reshape(-1, feat_dim)
+        x_norm2d = (x2d - mean) / std
+        return x_norm2d.reshape(x_subset.shape).astype(np.float32)
+
+    X_train_norm = _normalize_subset(X_train_raw)
+    X_val = _normalize_subset(X_val_raw)
+    X_test = _normalize_subset(X_test_raw)
+
+    logger.info(
+        "INFO: [Fold %d] Applied per-fold normalization using TRAIN statistics "
+        "(mean/std per channel).",
+        fold_idx + 1,
+    )
+
     haarye_class_id: Optional[int] = None
     for c_idx, name in idx_to_label.items():
         if name.upper() == "HAARYE":
             haarye_class_id = c_idx
             break
 
-    # Build balanced TRAIN set (downsample or upsample+augment depending on augment_minor)
     X_train, y_train = build_balanced_train_set(
-        X_train=X_train_raw,
+        X_train=X_train_norm,
         y_train=y_train_raw,
         augment_minor=augment_minor,
         logger=logger,
@@ -818,7 +849,8 @@ def train_one_fold(
 
     if augment_minor:
         logger.info(
-            "INFO: [Fold %d] Data augmentation ENABLED (upsampling minority classes to largest class with random noise/time-shift).",
+            "INFO: [Fold %d] Data augmentation ENABLED (upsampling minority classes "
+            "to largest class with structural + noise/time-shift augmentations).",
             fold_idx + 1,
         )
     else:
@@ -837,8 +869,10 @@ def train_one_fold(
         count_c = int((y_val == c).sum())
         logger.info("INFO:   %s: %d", idx_to_label[c], count_c)
 
-    seq_len = X.shape[1]
-    feat_dim = X.shape[2]
+    logger.info("INFO: [Fold %d] TEST per-class counts (unchanged):", fold_idx + 1)
+    for c in range(n_classes):
+        count_c = int((y_test == c).sum())
+        logger.info("INFO:   %s: %d", idx_to_label[c], count_c)
 
     logger.info(
         "INFO: [Fold %d] Using feature dimension per step: %d, sequence length: %d, batch_size=%d",
@@ -848,7 +882,6 @@ def train_one_fold(
         batch_size,
     )
 
-    # Dataset and loaders
     train_dataset = ClassificationDataset(X_train, y_train)
     val_dataset = ClassificationDataset(X_val, y_val)
     test_dataset = ClassificationDataset(X_test, y_test)
@@ -863,9 +896,7 @@ def train_one_fold(
         test_dataset, batch_size=batch_size, shuffle=False, drop_last=False
     )
 
-    # Model
     num_classes = len(idx_to_label)
-    # Positional arguments only to match external model signatures as well
     model = LSTMClassifier(
         feat_dim,
         hidden_size,
@@ -875,27 +906,34 @@ def train_one_fold(
         dropout,
     ).to(device)
 
-    logger.info(
-        "INFO: [Fold %d] Using weighted CrossEntropyLoss (special treatment for OTHER).",
-        fold_idx + 1,
-    )
-
-    # Special treatment for OTHER class via loss weight
-    weights = np.ones(num_classes, dtype=np.float32)
-    has_other = False
-    for idx, name in idx_to_label.items():
-        if name.upper() == "OTHER":
-            weights[idx] = other_class_weight
-            has_other = True
-    class_weights = torch.tensor(weights, dtype=torch.float32, device=device)
-    if has_other:
+    if use_class_weights:
         logger.info(
-            "INFO: OTHER class found, using weight=%.3f in loss.", other_class_weight
+            "INFO: [Fold %d] Using weighted CrossEntropyLoss (special treatment for OTHER).",
+            fold_idx + 1,
         )
+        weights = np.ones(num_classes, dtype=np.float32)
+        has_other = False
+        for idx, name in idx_to_label.items():
+            if name.upper() == "OTHER":
+                weights[idx] = other_class_weight
+                has_other = True
+        class_weights = torch.tensor(weights, dtype=torch.float32, device=device)
+        if has_other:
+            logger.info(
+                "INFO: OTHER class found, using weight=%.3f in loss.", other_class_weight
+            )
+        else:
+            logger.info(
+                "INFO: OTHER class not found, using uniform weights in weighted loss."
+            )
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
     else:
-        logger.info("INFO: OTHER class not found, using uniform weights in loss.")
+        logger.info(
+            "INFO: [Fold %d] Using unweighted CrossEntropyLoss (no class weights).",
+            fold_idx + 1,
+        )
+        criterion = nn.CrossEntropyLoss()
 
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.Adam(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay
     )
@@ -948,9 +986,9 @@ def train_one_fold(
 
     best_state = copy.deepcopy(model.state_dict())
     if early_stopping_metric.lower() == "macro_f1":
-        best_metric = -math.inf  # maximize
+        best_metric = -math.inf
     else:
-        best_metric = math.inf  # minimize (loss)
+        best_metric = math.inf
 
     best_val_loss = math.inf
     best_val_macro_f1 = 0.0
@@ -1001,10 +1039,9 @@ def train_one_fold(
             )
             break
 
-    # Load best state
     model.load_state_dict(best_state)
 
-    # Evaluate on TEST
+    # TEST evaluation
     model.eval()
     total_loss = 0.0
     total_correct = 0
@@ -1039,6 +1076,12 @@ def train_one_fold(
         confusion, idx_to_label
     )
 
+    # Macro precision / recall for this fold
+    prec_list = [m["precision"] for m in per_class_metrics.values()]
+    rec_list = [m["recall"] for m in per_class_metrics.values()]
+    test_macro_precision = float(np.mean(prec_list)) if prec_list else 0.0
+    test_macro_recall = float(np.mean(rec_list)) if rec_list else 0.0
+
     logger.info("INFO: Fold %d — Test Accuracy: %.2f%%", fold_idx + 1, test_acc * 100.0)
     log_confusion_matrix(confusion, idx_to_label)
 
@@ -1055,11 +1098,14 @@ def train_one_fold(
         )
 
     logger.info(
-        "INFO: [Fold %d] Test Loss = %.4f, Test Acc = %.2f%%, Test Macro-F1 = %.2f%%",
+        "INFO: [Fold %d] Test Loss = %.4f, Test Acc = %.2f%%, "
+        "Test Macro-F1 = %.2f%%, Test Macro-Precision = %.2f%%, Test Macro-Recall = %.2f%%",
         fold_idx + 1,
         test_loss,
         test_acc * 100.0,
         test_macro_f1 * 100.0,
+        test_macro_precision * 100.0,
+        test_macro_recall * 100.0,
     )
 
     result = {
@@ -1070,6 +1116,8 @@ def train_one_fold(
         "test_loss": test_loss,
         "test_acc": test_acc,
         "test_macro_f1": test_macro_f1,
+        "test_macro_precision": test_macro_precision,
+        "test_macro_recall": test_macro_recall,
         "test_confusion": confusion,
         "per_class_metrics": per_class_metrics,
     }
@@ -1084,9 +1132,9 @@ def train_one_fold(
 def train_cross_validation(
     data_path: str,
     patient_id: str = "Unknown",
-    cv_folds: int = 36,
-    val_per_class: int = 1,
-    test_per_class: int = 1,
+    cv_folds: int = 5,
+    val_per_class: int = 3,
+    test_per_class: int = 3,
     num_epochs: int = 200,
     batch_size: int = 64,
     learning_rate: float = 1e-3,
@@ -1100,6 +1148,9 @@ def train_cross_validation(
     early_stopping_metric: str = "macro_f1",
     other_class_weight: float = 0.8,
     augment_minor: bool = False,
+    use_class_weights: bool = False,
+    pool_size: int = 50,
+    force_preproc: bool = False,
     seed: int = 42,
     device: Optional[str] = None,
     log_dir: Optional[str] = None,
@@ -1107,15 +1158,7 @@ def train_cross_validation(
 ) -> None:
     """
     Main entry point used by main.py.
-
-    - LSTM-based classifier.
-    - Cyclic CV: samples move VAL -> TEST -> TRAIN without reuse of VAL/TEST.
-    - TRAIN is balanced either by downsampling to the smallest class
-      or by upsampling minority classes with data augmentation (augment_minor).
-    - Macro-F1 is used as early stopping metric by default.
-    - OTHER class handled via loss weight.
     """
-    # Backward compatibility: if main still passes num_folds – use it as cv_folds
     if "num_folds" in kwargs:
         old = kwargs.pop("num_folds")
         logger.info(
@@ -1123,13 +1166,18 @@ def train_cross_validation(
         )
         cv_folds = int(old)
 
-    # ignore any remaining extra args
     for k in kwargs.keys():
         logger.info(
             "INFO: Ignoring extra argument passed to train_cross_validation: %s", k
         )
 
-    del log_dir  # currently not used, kept for API compatibility
+    del log_dir
+
+    if force_preproc:
+        logger.info(
+            "INFO: force_preproc=True was requested, but preprocessing must be handled "
+            "outside train_classification.py (this module expects a ready .npy at data_path)."
+        )
 
     set_seed(seed)
 
@@ -1139,11 +1187,12 @@ def train_cross_validation(
         device_t = torch.device(device)
     logger.info("INFO: Using device: %s", device_t)
     logger.info("INFO: Requested cv_folds=%d", cv_folds)
+    logger.info("INFO: Using pool_size=%d for temporal pooling.", pool_size)
 
-    # Load data
-    X, y, idx_to_label, label_to_idx = load_classification_data(data_path)
+    X, y, idx_to_label, label_to_idx = load_classification_data(
+        data_path, pool_size=pool_size
+    )
 
-    # Baseline: majority class
     unique, counts = np.unique(y, return_counts=True)
     majority_idx = int(unique[np.argmax(counts)])
     majority_name = idx_to_label[majority_idx]
@@ -1160,7 +1209,6 @@ def train_cross_validation(
     )
     logger.info("INFO: ===== END OF LABEL / INFORMATION QUALITY CHECK =====")
 
-    # Build folds (with error if cv_folds too large)
     folds = build_cyclic_stratified_folds(
         y=y,
         label_to_idx=label_to_idx,
@@ -1197,6 +1245,7 @@ def train_cross_validation(
             early_stopping_metric=early_stopping_metric,
             other_class_weight=other_class_weight,
             augment_minor=augment_minor,
+            use_class_weights=use_class_weights,
         )
         all_results.append(result)
         overall_confusion += result["test_confusion"].astype(int)
@@ -1212,7 +1261,6 @@ def train_cross_validation(
             result["test_loss"],
         )
 
-    # Summary
     logger.info("INFO: ========== CLASSIFICATION OVERALL RESULTS ========== ")
     for r in all_results:
         logger.info(
@@ -1227,7 +1275,20 @@ def train_cross_validation(
         )
 
     test_accs = [r["test_acc"] for r in all_results]
+    macro_f1s = [r["test_macro_f1"] for r in all_results]
+    macro_precs = [r["test_macro_precision"] for r in all_results]
+    macro_recs = [r["test_macro_recall"] for r in all_results]
+
     mean_test_acc = float(np.mean(test_accs)) if len(test_accs) > 0 else 0.0
+    max_test_acc = float(np.max(test_accs)) if len(test_accs) > 0 else 0.0
+    mean_macro_f1 = float(np.mean(macro_f1s)) if len(macro_f1s) > 0 else 0.0
+    max_macro_f1 = float(np.max(macro_f1s)) if len(macro_f1s) > 0 else 0.0
+
+    mean_macro_prec = float(np.mean(macro_precs)) if len(macro_precs) > 0 else 0.0
+    max_macro_prec = float(np.max(macro_precs)) if len(macro_precs) > 0 else 0.0
+    mean_macro_rec = float(np.mean(macro_recs)) if len(macro_recs) > 0 else 0.0
+    max_macro_rec = float(np.max(macro_recs)) if len(macro_recs) > 0 else 0.0
+
     logger.info(
         "INFO: Mean test accuracy over %d folds: %.2f%%",
         len(all_results),
@@ -1259,11 +1320,15 @@ def train_cross_validation(
     )
 
     # ========= T-TEST vs baseline accuracy =========
+    t_statistic: Optional[float] = None
+    t_p_value: Optional[float] = None
     if len(test_accs) > 1:
         try:
             from scipy.stats import ttest_1samp
 
             t_stat, p_val = ttest_1samp(test_accs, popmean=majority_acc)
+            t_statistic = float(t_stat)
+            t_p_value = float(p_val)
             logger.info(
                 "INFO: T-TEST vs baseline accuracy (%.2f%%): t=%.4f, p=%.4g",
                 majority_acc * 100.0,
@@ -1280,17 +1345,51 @@ def train_cross_validation(
             len(test_accs),
         )
 
+    # ===== FINAL SUMMARY FOR TABLE (per patient) =====
+    logger.info("INFO: ===== SUMMARY FOR TABLE =====")
+    logger.info("INFO: Patient: %s", patient_id)
+    logger.info(
+        "INFO: Avg Accuracy = %.2f%% | Max Accuracy = %.2f%%",
+        mean_test_acc * 100.0,
+        max_test_acc * 100.0,
+    )
+    logger.info(
+        "INFO: Avg F1 = %.2f%% | Max F1 = %.2f%%",
+        mean_macro_f1 * 100.0,
+        max_macro_f1 * 100.0,
+    )
+    logger.info(
+        "INFO: Avg Precision = %.2f%% | Max Precision = %.2f%%",
+        mean_macro_prec * 100.0,
+        max_macro_prec * 100.0,
+    )
+    logger.info(
+        "INFO: Avg Recall = %.2f%% | Max Recall = %.2f%%",
+        mean_macro_rec * 100.0,
+        max_macro_rec * 100.0,
+    )
+    if t_statistic is not None:
+        logger.info(
+            "INFO: Avg T Test = %.4f | Max T test = %.4f | p-value = %.4g",
+            t_statistic,
+            t_statistic,
+            t_p_value if t_p_value is not None else float("nan"),
+        )
+    else:
+        logger.info(
+            "INFO: Avg T Test = N/A | Max T test = N/A (T-test not computed)."
+        )
+
 
 if __name__ == "__main__":
-    # Optional debug entry point (not used by main.py)
     import argparse
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--patient_id", type=str, default="Unknown")
     parser.add_argument("--cv_folds", type=int, default=5)
-    parser.add_argument("--val_per_class", type=int, default=1)
-    parser.add_argument("--test_per_class", type=int, default=1)
+    parser.add_argument("--val_per_class", type=int, default=3)
+    parser.add_argument("--test_per_class", type=int, default=3)
     parser.add_argument("--num_epochs", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
@@ -1304,6 +1403,9 @@ if __name__ == "__main__":
     parser.add_argument("--early_stopping_metric", type=str, default="macro_f1")
     parser.add_argument("--other_class_weight", type=float, default=0.5)
     parser.add_argument("--augment_minor", action="store_true")
+    parser.add_argument("--use_class_weights", action="store_true")
+    parser.add_argument("--pool_size", type=int, default=50)
+    parser.add_argument("--force_preproc", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -1328,5 +1430,8 @@ if __name__ == "__main__":
         early_stopping_metric=args.early_stopping_metric,
         other_class_weight=args.other_class_weight,
         augment_minor=args.augment_minor,
+        use_class_weights=args.use_class_weights,
+        pool_size=args.pool_size,
+        force_preproc=args.force_preproc,
         seed=args.seed,
     )

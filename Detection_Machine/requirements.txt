@@ -1,0 +1,43 @@
+# Core scientific computing
+numpy
+scipy
+pandas
+
+# Plotting / visualization
+matplotlib
+
+# Deep learning
+torch
+
+# Hyperparameter optimization
+optuna
+
+# Metrics / ML utilities
+scikit-learn
+
+# Notebooks / interactive work
+jupyter
+ipykernel
+notebook
+jupyterlab
+
+# MATLAB v7.3 / HDF5 I/O
+h5py
+
+# Progress bars / UX
+tqdm
+
+# Configuration / CLI helpers
+pyyaml
+
+# Experiment logging (optional but useful)
+tensorboard
+
+# Data formats / serialization helpers
+joblib
+
+# Development / quality (optional)
+pytest
+black
+isort
+flake8

@@ -1,0 +1,52 @@
+{
+  "patients": {
+    "Patient_01": {
+      "lfp_folder": "Patient_01/LFP_signals/",
+      "labels_file": "Patient_01/Labels/Detection_Labels/Patient1_Labels_Detection.txt",
+      "offset_file": "Patient_01/sound_w_times.mat",
+      "sample_rate": 2000,
+      "window_size": 1000,
+      "stride": 400,
+      "overlap": 0.5,
+      "batch_size": 64,
+      "learning_rate": 0.001,
+      "epochs": 80
+    },
+    "Patient_02": {
+      "lfp_folder": "Patient_02/LFP_signals/",
+      "labels_file": "Patient_02/Labels/Detection_Labels/Patient2_Labels_Detection.txt",
+      "offset_file": "Patient_02/sound_w_times.mat",
+      "sample_rate": 2000,
+      "window_size": 1000,
+      "stride": 400,
+      "overlap": 0.5,
+      "batch_size": 64,
+      "learning_rate": 0.001,
+      "epochs": 80
+    },
+    "Patient_03": {
+      "lfp_folder": "Patient_03/LFP_signals/",
+      "labels_file": "Patient_03/Labels/Detection_Labels/Patient3_Labels_Detection.txt",
+      "offset_file": "Patient_03/sound_w_times.mat",
+      "sample_rate": 2000,
+      "window_size": 1000,
+      "stride": 400,
+      "overlap": 0.5,
+      "batch_size": 64,
+      "learning_rate": 0.001,
+      "epochs": 80
+    },
+    "Patient_04": {
+      "lfp_folder": "Patient_04/LFP_signals/",
+      "labels_file": "Patient_04/Labels/Detection_Labels/Patient4_Labels_Detection.txt",
+      "offset_file": "Patient_04/sound_w_times.mat",
+      "sample_rate": 2000,
+      "window_size": 1000,
+      "stride": 400,
+      "overlap": 0.5,
+      "batch_size": 64,
+      "learning_rate": 0.001,
+      "epochs": 80
+    }
+  }
+}

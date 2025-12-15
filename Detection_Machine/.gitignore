@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+*.pt
+*.pth
+*.ckpt
+
+*.npy
+*.npz
+
+runs/
+logs/
+*.tfevents.*
+
+processed_data/
+.DS_Store

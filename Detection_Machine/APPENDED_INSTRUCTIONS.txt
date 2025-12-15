@@ -1,0 +1,294 @@
+APPENDED_INSTRUCTIONS
+Detection Machine – LFP Speech/NoSpeech Detection
+
+מסמך זה מסביר את תצורת הדאטה, ה־pipeline, שלבי ההרצה, דגלי CLI, תוצרים ותקלות נפוצות עבור מערכת ה־Detection (זיהוי דיבור/ללא־דיבור) המבוססת על אותות LFP.
+
+====================================================================
+Data Configuration (patients_config.json)
+====================================================================
+
+הקובץ config/patients_config.json מכיל עבור כל פציינט:
+
+1) lfp_folder
+   נתיב יחסי (מתחת ל־BASE_DATA_PATH) לתיקייה שמכילה קבצי LFP כ־.mat (פר־ערוץ).
+
+2) labels_file
+   נתיב יחסי (מתחת ל־BASE_DATA_PATH) לקובץ תוויות דיבור.
+   הקובץ נקרא כ־TSV עם עמודות: start, end, label.
+
+3) offset_file
+   נתיב יחסי (מתחת ל־BASE_DATA_PATH) לקובץ offset מסוג .mat (למשל sound_w_times.mat).
+   ממנו מופק offset זמן (בשניות) ע"י קריאת dataset בשם:
+   new_start_end_times_micsec
+
+4) sample_rate
+   תדירות דגימה (Hz). משמשת ב־feature engineering (פילטר/סמוט’ינג).
+
+5) window_size, stride
+   פרמטרים לחילוץ חלונות (במספר דגימות).
+   חשוב:
+   - קוד האימון משתמש בפועל ב־window_size ו־stride.
+   - אם קיים overlap בקונפיג — הוא לא בשימוש בקוד האימון הנוכחי.
+
+6) batch_size, learning_rate, epochs
+   היפר־פרמטרים לאימון מודל ה־detection.
+
+--------------------------------------------------------------------
+defines.py (Paths)
+--------------------------------------------------------------------
+
+הקובץ Final_Project/Detection_machine/defines.py מגדיר:
+
+- BASE_DATA_PATH
+  נתיב מוחלט לתיקיית הדאטה הגולמית (שמכילה Patient_01, Patient_02, ...).
+
+- PATIENTS_CONFIG_PATH
+  הנתיב ל־config/patients_config.json.
+
+- PROCESSED_DATA_DIR
+  תיקיית תוצרים מעובדים: processed_data/ תחת שורש הפרויקט.
+
+הערה:
+הנתיב BASE_DATA_PATH יכול לכלול תווים בעברית (Windows). ברוב המקרים זה עובד, אך אם יש תקלות פתיחה/נתיבים, מומלץ לשקול להעביר את הדאטה לנתיב ללא תווים לא־לטיניים.
+
+====================================================================
+Pipeline Overview
+====================================================================
+
+--------------------------------------------------------------------
+1) Preprocessing
+--------------------------------------------------------------------
+
+מתבצע דרך:
+- Final_Project/Detection_machine/preprocessing/preprocessing.py
+
+פונקציות עיקריות:
+- process_all_patients(patient_id=...)
+- process_patient(patient_name, patient_info)
+
+מה מתבצע:
+1. קריאת תוויות מהקובץ labels_file (TSV: start/end/label).
+2. קריאת offset מהקובץ offset_file והפקת offset_sec.
+3. יצירת עמודות:
+   - start_adj = start + offset_sec
+   - end_adj   = end + offset_sec
+4. יצוא LFP לערוצי CSV (פר ערוץ):
+   - processed_data/<Patient_ID>/csvs/*.csv
+   - כל CSV מכיל עמודות: time, signal
+5. יצוא תוויות מיושרות:
+   - processed_data/<Patient_ID>/labels_aligned.csv
+   - כולל start_adj, end_adj, label (וגם start/end המקוריים אם נשמרים)
+
+תוצר נוסף (legacy / תאימות לקוד אחר):
+- processed_data/<Patient_ID>_detection_data.npy
+  קובץ numpy המכיל רשימת dict-ים (פר חלון/קטע), עם:
+  - channel
+  - signals (מערך באורך fixed_length, ברירת מחדל 300)
+  - label
+  - is_speech
+
+חשוב:
+קובץ ה־.npy הזה נשמר בשורש processed_data/ ולא בתוך תיקיית הפציינט.
+
+--------------------------------------------------------------------
+2) Detection Training (Conv + BiLSTM + Attention, 10-fold CV)
+--------------------------------------------------------------------
+
+מתבצע דרך:
+- Final_Project/Detection_machine/Detection/train_detection.py
+- פונקציה: train(config, patient_id=..., ...)
+
+מה מתבצע:
+1. טעינת CSVים:
+   - processed_data/<Patient_ID>/csvs/*.csv
+   - איחוד לערך signals בגודל (N_samples, N_channels) וציר זמן time.
+
+2. טעינת תוויות מיושרות:
+   - processed_data/<Patient_ID>/labels_aligned.csv
+
+3. חילוץ חלונות (Sliding Window) על האזור המסומן בלבד:
+   - חלונות באורך window_size ובצעד stride
+   - נדרשת דרישת "חלון בתוך אזור מתויג":
+     כל הדגימות בחלון חייבות להיות בתוך labeled_mask
+
+4. ניקוי/סינון חלונות לפי “רמת דיבור” (coverage-based cleanup):
+   - אם fraction(dיבור) >= SPEECH_FRACTION_HIGH -> label=1
+   - אם fraction(dיבור) <= SPEECH_FRACTION_LOW  -> label=0
+   - אחרת -> החלון מושמט (ambiguous)
+
+5. איזון מחלקות (כפי שממומש כרגע):
+   - downsampling למחלקה הקטנה יותר כך שמספר הדוגמאות זהה בין speech ו־non-speech.
+
+6. 10-fold Cross-Validation:
+   - חלוקה מחזורית per-class ל־TRAIN/VAL/TEST
+   - אימון המודל עם early stopping
+   - בחירת threshold אופטימלי על VAL לפי accuracy או f1
+   - חישוב מדדים על TEST (Accuracy/Precision/Recall/F1)
+   - אופציונלי: smoothing על הסתברויות עם smooth_k
+
+====================================================================
+How to Run
+====================================================================
+
+Recommended: הרצה דרך main.py.
+
+main.py מבצע:
+- קובע patient_id
+- אופציונלית מפעיל preprocessing (רק אם --force_preproc)
+- מפעיל אימון detection אלא אם --skip_train_detection
+
+דוגמה – preprocessing + אימון (Patient_01):
+python main.py --patient_id Patient_01 --force_preproc
+
+דוגמה – אימון בלבד (בהנחה שכבר יש processed_data מוכן):
+python main.py --patient_id Patient_01 --skip_preproc
+
+====================================================================
+CLI Flags (Terminal)
+====================================================================
+
+הדגלים העיקריים להרצה (דרך main.py):
+
+1) --patient_id
+   בוחר פציינט להרצה (למשל Patient_01, Patient_02 וכו’).
+   דוגמה:
+   python main.py --patient_id Patient_03
+
+2) --force_preproc
+   מוחק את תיקיית הפציינט ב־processed_data ומריץ preprocessing מחדש עבור הפציינט שנבחר.
+   דוגמה:
+   python main.py --patient_id Patient_03 --force_preproc
+
+3) --skip_preproc
+   מדלג על preprocessing (גם אם זו הרצה ראשונה).
+   שימושי כשאתה בטוח שהקבצים המעובדים קיימים.
+   דוגמה:
+   python main.py --patient_id Patient_03 --skip_preproc
+
+4) --skip_train_detection
+   מדלג על שלב אימון ה־detection.
+   דוגמה:
+   python main.py --patient_id Patient_03 --force_preproc --skip_train_detection
+
+5) --FE
+   מפעיל feature engineering בשלב האימון:
+   - band-pass filter
+   - smoothing קצר (moving average ~10ms)
+   דוגמה:
+   python main.py --patient_id Patient_01 --FE
+
+6) --fe_low <float> , --fe_high <float>
+   תדרי חיתוך עבור band-pass (בשימוש רק יחד עם --FE).
+   דוגמה:
+   python main.py --patient_id Patient_01 --FE --fe_low 1 --fe_high 150
+
+7) --use_focal
+   משתמש ב־Focal Loss במקום BCEWithLogitsLoss.
+   דוגמה:
+   python main.py --patient_id Patient_01 --use_focal
+
+8) --threshold_metric {f1,accuracy}
+   מגדיר באיזה metric לבחור decision threshold על VAL.
+   ברירת מחדל: accuracy.
+   דוגמה:
+   python main.py --patient_id Patient_01 --threshold_metric f1
+
+9) --smooth_k <int>
+   מפעיל smoothing (ממוצע נע) על הסתברויות לפני קבלת החלטה (ובעבור threshold selection).
+   1 = ללא smoothing
+   דוגמה:
+   python main.py --patient_id Patient_01 --smooth_k 5
+
+====================================================================
+Outputs
+====================================================================
+
+במהלך האימון יודפסו:
+
+1) פרטי קונפיג והרצה:
+   - patient, device
+   - window_size, stride, batch_size, lr, epochs
+   - FE (אם פעיל) + fe_low/fe_high
+   - loss (BCE או Focal)
+   - threshold metric
+   - smooth_k
+
+2) לכל Fold (ב־10-fold CV):
+   - Train loss לכל epoch
+   - Val metric (accuracy או f1) לכל epoch
+   - Best VAL metric
+   - threshold נבחר על VAL + score
+   - VAL metrics @ best_thr: Accuracy/Precision/Recall/F1
+   - TEST metrics (raw): Accuracy/Precision/Recall/F1 + TP/FP/TN/FN
+   - אם smooth_k > 1:
+     - TEST metrics (smoothed)
+     - ΔAcc ו־ΔF1 (smoothed - raw)
+
+3) Summary בסיום:
+   - Mean/Std של Accuracy/Precision/Recall/F1 על פני כל ה־folds (RAW)
+   - Max metrics (RAW) לטבלה
+   - אם smooth_k > 1:
+     - Mean/Std גם ל־SMOOTHED
+     - Δ מול RAW
+     - paired t-test (SMOOTHED vs RAW) על פני ה־folds, אם ניתן לחשב
+
+4) שורות סיכום קומפקטיות:
+   - RUN SUMMARY (קל להעתקה להשוואות בין ריצות)
+   - TABLE SUMMARY (תואם לטבלה: Avg/Max Accuracy, F1, Precision, Recall, וערכי t-test אם קיימים)
+
+====================================================================
+Troubleshooting
+====================================================================
+
+1) RuntimeError: No valid overlap between labels and signal time axis
+   משמעות: אין חפיפה בין טווחי הזמן של labels_aligned.csv לבין ציר הזמן ב־CSVים.
+
+   סיבה נפוצה:
+   - התוויות מיושרות לזמן מוחלט (start_adj/end_adj = start + offset),
+     אך ה־CSVים מכילים זמן יחסי (0..T).
+
+   פתרון:
+   - לוודא שציר הזמן בקבצי ה־CSV והזמנים ב־labels נמצאים באותה מערכת ייחוס:
+     או ש־CSV מכיל זמן מוחלט (מומלץ), או שהתוויות נשארות יחסי־זמן.
+
+2) FileNotFoundError על labels_aligned.csv או csvs/
+   משמעות: preprocessing לא רץ, או רץ על תיקייה אחרת.
+
+   פתרון:
+   python main.py --patient_id Patient_01 --force_preproc
+
+3) CUDA / GPU
+   אם אין CUDA, הקוד ירוץ על CPU אוטומטית.
+   להתקנת PyTorch עם GPU יש להשתמש בהוראות PyTorch הרשמיות בהתאם לגרסת CUDA.
+
+4) תוצאות smoothing לא הגיוניות
+   smoothing אמור להיות מיושם על רצף חלונות לפי זמן.
+   אם החלונות מעורבבים לפני smoothing, smoothing יאבד משמעות.
+
+   פתרון מומלץ:
+   - לשמור סדר חלונות לפי זמן ב־VAL/TEST כאשר משתמשים ב־smooth_k > 1,
+     או למיין לפי אינדקס/זמן לפני החלת smoothing.
+
+====================================================================
+Notes / Recommendations
+====================================================================
+
+1) overlap בקונפיג
+   overlap קיים בקונפיג אך לא בשימוש בקוד האימון הנוכחי.
+   מומלץ להסיר overlap או לאחד לוגיקה (overlap↔stride) כדי למנוע בלבול.
+
+2) איזון מחלקות לפני CV
+   איזון גלובלי (לפני CV) משנה את התפלגות VAL/TEST ועלול להשפיע על אמינות ההערכה.
+   נהוג יותר:
+   - לאזן רק את TRAIN בכל fold
+   - להשאיר VAL/TEST בהתפלגות טבעית.
+
+3) CV לפי זמן (Leakage)
+   חלונות סמוכים בזמן עלולים לגרום ל־leakage אם TRAIN ו־TEST מכילים חלונות מאותו קטע זמן.
+   להערכה אמינה יותר, מומלץ לבצע חלוקה לפי בלוקים רציפים בזמן (time-based blocking).
+
+4) קבצים שנוצרים מחוץ לתיקיית הפציינט
+   preprocessing מייצר גם:
+   processed_data/<Patient_ID>_detection_data.npy
+   קובץ זה אינו נמצא תחת processed_data/<Patient_ID>/.
+   אם מבצעים ניקוי/ריצה מחדש, חשוב לזכור שקובץ זה יכול להישאר ישן אם לא מוחקים אותו במפורש.

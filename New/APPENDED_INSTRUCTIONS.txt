@@ -1,0 +1,99 @@
+Data Configuration (patients_config.json)
+
+הקובץ config/patients_config.json מכיל עבור כל פציינט:
+
+labels_file – נתיב יחסי לקובץ תוויות (Labels.txt / Atias_Labels.txt)
+lfp_folder – תיקייה שמכילה CSC*_LFP.mat
+offset_file – קובץ offset (נבדק קיום; הקוד עושה auto-detect offset בפועל)
+sample_rate, window_size
+פרמטרים הקשורים ל־OTHER (למשל other_ratio, other_margin_ms, other_stride_ms, target_other_pos_ratio)
+הקוד מנסה לפתור נתיבים יחסיים לפי בסיסי נתונים אפשריים (כמו Data/ מקומי, או Google Drive), באמצעות הלוגיקה ב־defines.py.
+
+Pipeline Overview:
+Preprocessing מתבצע דרך:
+preprocessing/preprocessing.py
+הפונקציה: run_classification_preprocessing(patient_id=...)
+מה נוצר:
+processed_data/{patient_id}_classification_data.npy
+קובץ שמכיל רשימת חלונות (dict לכל חלון) עם:
+signals: מערך [T_raw, C]
+label: למשל HAARYE / TUT / OTHER
+is_speech: True/False
+ועוד מטא־דאטה (למשל זמנים)
+בנוסף: נבנים גם features לכל חלון (אם מופעל בקוד)
+
+
+Classification (Training + Cyclic CV)
+מתבצע דרך:
+Classification/train_classification.py
+הפונקציה: train_cross_validation(...)
+בכל Fold:
+חלוקה מחזורית ל־TRAIN/VAL/TEST
+נרמול (Normalization) לפי סטטיסטיקות TRAIN בלבד (למניעת leakage)
+איזון TRAIN:
+בלי augmentation: downsampling למחלקה הקטנה ביותר
+עם augmentation: upsampling למחלקות מיעוט עם augmentations
+אימון LSTM + Early Stopping
+חישוב Accuracy, Macro-F1, Confusion Matrix, Precision/Recall per class
+
+
+How to Run
+Recommended: Run via main.py
+main.py דואג:
+לוודא ש־processed_data/{patient_id}_classification_data.npy קיים
+אם חסר או אם --force_preproc פעיל: להריץ preprocessing מחדש
+ואז להריץ אימון classification
+
+
+דוגמה:
+python main.py --patient_id Patient_03 --cv_folds 6 --val_per_class 3 --test_per_class 3
+CLI Flags (Terminal)
+
+להלן הדגלים העיקריים להרצה (דרך main.py, ומשקפים את האימון ב־train_classification.py):
+--patient_id
+מספר/שם פציינט שעליו רוצים להריץ את הקוד (למשל Patient_01, Patient_03, Patient_04).
+דוגמה:
+python main.py --patient_id Patient_03
+--cv_folds
+מספר ה־FOLDS בהרצה (Cyclic Cross-Validation).
+דוגמה:
+python main.py --patient_id Patient_03 --cv_folds 6
+--augment_minor
+ביצוע DATA AUGMENTATION למחלקות מיעוט ב־TRAIN.
+ללא דגל: איזון TRAIN באמצעות downsampling (למחלקה הקטנה ביותר)
+עם דגל: איזון TRAIN באמצעות upsampling עם augmentation (noise / time shift / time warp / envelope)
+דוגמה:
+python main.py --patient_id Patient_03 --augment_minor
+--val_per_class (ברירת מחדל: 3)
+מספר הדגימות לכל מחלקה שמוקצות ל־VAL בכל Fold.
+דוגמה:
+python main.py --patient_id Patient_03 --val_per_class 3
+--test_per_class (ברירת מחדל: 3)
+מספר הדגימות לכל מחלקה שמוקצות ל־TEST בכל Fold.
+דוגמה:
+python main.py --patient_id Patient_03 --test_per_class 3
+--use_class_weights
+קבוצות לא מאוזנות ושימוש במשקלים ב־loss (CrossEntropy).
+ב־train_classification.py זה מאפשר לתעדף/להעניש אחרת מחלקות (בפרט ניתן משקל שונה ל־OTHER באמצעות הפרמטר other_class_weight בקוד).
+דוגמה (הרצה ישירה של train_classification):
+python Classification/train_classification.py --data_path processed_data/Patient_03_classification_data.npy --use_class_weights
+הערה חשובה: לפי הקוד הנוכחי, main.py לא מעביר את הדגל --use_class_weights לתוך train_cross_validation(...).
+אם אתה רוצה שהדגל ישפיע גם כשמריצים דרך main.py, צריך להעביר אותו בקריאה ל־train_cross_validation.
+--force_preproc
+עשייה מחדש של preprocessing ומחיקה/דריסה של דאטא ישן.
+כאשר הדגל פעיל, main.py מריץ מחדש את run_classification_preprocessing ומייצר מחדש את:
+processed_data/{patient_id}_classification_data.npy
+דוגמה:
+python main.py --patient_id Patient_03 --force_preproc
+Outputs
+במהלך הריצה יודפסו:
+Train/Val Loss, Accuracy, Val Macro-F1
+תוצאות TEST לכל Fold
+Confusion Matrix לכל Fold + Overall
+Summary סופי: Average/Max Accuracy, Macro-F1, Precision, Recall (וכן baseline/chance logs)
+
+
+Troubleshooting
+FileNotFoundError / paths: בדוק patients_config.json וודא שהנתיבים היחסיים קיימים תחת אחד מבסיסי הנתונים ש־defines.py מזהה.
+CUDA / GPU: אם אין CUDA, הריצה תתבצע על CPU. להתקנה עם GPU יש לעקוב אחרי הוראות PyTorch.
+כמות דגימות ל־CV: אם אין מספיק דגימות למחלקה כלשהי עבור val_per_class ו־cv_folds, הקוד עשוי לעצור עם שגיאה שמסבירה מה המקסימום האפשרי.

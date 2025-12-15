@@ -1193,6 +1193,15 @@ def train_cross_validation(
         data_path, pool_size=pool_size
     )
 
+    # --- Chance level (uniform over classes) -----------------------------  # <<< NEW
+    n_classes = len(idx_to_label)                                          # <<< NEW
+    chance_level = 1.0 / max(n_classes, 1)                                 # <<< NEW
+    logger.info(                                                           # <<< NEW
+        "INFO: [Chance] Chance-level accuracy (1/%d classes): %.2f%%",     # <<< NEW
+        n_classes,                                                         # <<< NEW
+        chance_level * 100.0,                                              # <<< NEW
+    )                                                                      # <<< NEW
+
     unique, counts = np.unique(y, return_counts=True)
     majority_idx = int(unique[np.argmax(counts)])
     majority_name = idx_to_label[majority_idx]
@@ -1335,6 +1344,9 @@ def train_cross_validation(
                 t_stat,
                 p_val,
             )
+            logger.info(  # <<< NEW
+                "INFO: p-test (p-value vs baseline) = %.4g", p_val  # <<< NEW
+            )  # <<< NEW
         except Exception as e:
             logger.info(
                 "INFO: Could not compute T-TEST (scipy missing or error: %s).", str(e)
@@ -1348,6 +1360,11 @@ def train_cross_validation(
     # ===== FINAL SUMMARY FOR TABLE (per patient) =====
     logger.info("INFO: ===== SUMMARY FOR TABLE =====")
     logger.info("INFO: Patient: %s", patient_id)
+    logger.info(
+        "INFO: Chance level = %.2f%% (1/%d classes)",           # <<< NEW
+        chance_level * 100.0,                                   # <<< NEW
+        len(idx_to_label),                                      # <<< NEW
+    )                                                           # <<< NEW
     logger.info(
         "INFO: Avg Accuracy = %.2f%% | Max Accuracy = %.2f%%",
         mean_test_acc * 100.0,
@@ -1370,7 +1387,7 @@ def train_cross_validation(
     )
     if t_statistic is not None:
         logger.info(
-            "INFO: Avg T Test = %.4f | Max T test = %.4f | p-value = %.4g",
+            "INFO: Avg T Test = %.4f | Max T test = %.4f | p-test = %.4g",  # <<< NEW (label p-test)
             t_statistic,
             t_statistic,
             t_p_value if t_p_value is not None else float("nan"),
